@@ -64,7 +64,6 @@ def round_to_quarter(dt: datetime.datetime) -> datetime.datetime:
     q = int(round(mins / 15.0))  # 0..4
     return base + datetime.timedelta(minutes=15 * q)
 
-
 # =========================
 # Data processing
 # =========================
@@ -139,7 +138,7 @@ def build_segs(df):
                 "e": first_cs,
                 "dur": (first_cs - eight).total_seconds() / 3600.0,
                 "ot": None, "dt": None, "on": None, "dn": None,
-                "force_other": True   # <— flag picked up by allocator
+                "force_other": True
             })
 
         # --- Normal segments + in-day gaps ---
@@ -169,7 +168,6 @@ def build_segs(df):
 
     return segs
 
-
 def alloc_detailed(segs):
     """
     Returns a flat table:
@@ -189,7 +187,7 @@ def alloc_detailed(segs):
 
     rows = []
     for s in segs:
-        # owner inference (unchanged, except forced 'Other' honored)
+        # owner inference
         if s.get("force_other"):
             owner = "Other"
         else:
@@ -210,9 +208,9 @@ def alloc_detailed(segs):
         rs = round_to_quarter(s["s"])
         re = round_to_quarter(s["e"])
         if re <= rs:
-            continue  # very short segment collapsed by rounding
+            continue
 
-        hours = (re - rs).total_seconds() / 3600.0  # exact (no rounding)
+        hours = (re - rs).total_seconds() / 3600.0  # exact on rounded bounds
 
         rows.append(
             {
@@ -230,10 +228,8 @@ def alloc_detailed(segs):
         df = df.sort_values(["Date", "Start Time"]).reset_index(drop=True)
     return df
 
-
-
 # =========================
-# NEW: Consolidate contiguous same-client rows
+# Consolidate contiguous same-client rows
 # =========================
 def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -286,148 +282,98 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
     return out
 
-
 # =========================
-# Styled PDF (Detailed Rows)
+# Styled PDF (Detailed Rows) — with Day/Date merges, no zebra, Work Performed column
 # =========================
-    def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            doc = SimpleDocTemplate(
-                tmp.name,
-                pagesize=landscape(letter),
-                leftMargin=0.5 * inch,
-                rightMargin=0.5 * inch,
-                topMargin=0.5 * inch,
-                bottomMargin=0.5 * inch,
-            )
-    
-            # Styles
-            h_style = ParagraphStyle(
-                "H",
-                fontName=PDF_FONT_BOLD,
-                fontSize=18,
-                alignment=TA_CENTER,
-                spaceAfter=28,
-                textColor=colors.HexColor("#31333f"),
-            )
-            l_style = ParagraphStyle(
-                "L",
-                fontName=PDF_FONT,
-                fontSize=10,
-                spaceAfter=10,
-                textColor=colors.HexColor("#31333f"),
-            )
-    
-            total_hrs = float(df_week["Client Hours"].fillna(0).sum())
-            th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
-    
-            elems = [
-                Paragraph("HCB TIMESHEET", h_style),
-                Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
-                Paragraph(f"Week of: <b>{week_monday:%B %-d, %Y}</b>", l_style),
-                Paragraph(
-                    f'Total Hours: <b><font backcolor="#fffac1" color="#373737">{th}</font></b>',
-                    l_style,
-                ),
-                Spacer(1, 0.18 * inch),
-            ]
-    
-            display_df = df_week.copy()
-    
-            def fmt_time(t):
-                if pd.isna(t):
-                    return ""
-                return f"{int(t.hour):02d}:{int(t.minute):02d}"
-    
-            if not display_df.empty:
-                display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
-                display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
-                display_df["End Time"] = display_df["End Time"].apply(fmt_time)
-                display_df["Client Hours"] = display_df["Client Hours"].apply(
-                    lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
-                )
-    
-            headers = ["Day", "Date", "Start", "End", "Client", "Hours"]
-            data = [headers] + display_df.rename(
-                columns={
-                    "Day of week": "Day",
-                    "Client Name": "Client",
-                    "Client Hours": "Hours",
-                    "Start Time": "Start",
-                    "End Time": "End",
-                }
-            )[headers].values.tolist()
-    
-            # helper: add vertical spans for contiguous equal values; blank duplicates
-            def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
-                if len(data_matrix) <= first_data_row:
-                    return
-                r0 = first_data_row
-                vals = [row[col_idx] for row in data_matrix[first_data_row:]]
-                i = 0
-                while i < len(vals):
-                    j = i + 1
-                    while j < len(vals) and vals[j] == vals[i]:
-                        j += 1
-                    if (j - i) > 1 and str(vals[i]) != "":
-                        style_list.append(("SPAN", (col_idx, r0 + i), (col_idx, r0 + j - 1)))
-                        for k in range(i + 1, j):
-                            data_matrix[first_data_row + k][col_idx] = ""
-                    i = j
-    
-            total_width = landscape(letter)[0] - doc.leftMargin - doc.RightMargin if hasattr(doc, "RightMargin") else landscape(letter)[0] - doc.leftMargin - doc.rightMargin
-            col_widths = [
-                1.1 * inch,  # Day
-                1.3 * inch,  # Date
-                1.0 * inch,  # Start
-                1.0 * inch,  # End
-                total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
-                0.9 * inch,  # Hours
-            ]
-    
-            tbl = Table(data, colWidths=col_widths, repeatRows=1)
-            style = [
-                # header
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
-                ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
-                ("FONTSIZE", (0, 0), (-1, 0), 10),
-                ("ALIGN", (0, 0), (-1, 0), "LEFT"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-                ("TOPPADDING", (0, 0), (-1, 0), 8),
-    
-                # body defaults
-                ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
-                ("FONTSIZE", (0, 1), (-1, -1), 10),
-                ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
-                ("TOPPADDING", (0, 1), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
-    
-                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
-                ("ALIGN", (2, 1), (3, -1), "RIGHT"),
-                ("ALIGN", (5, 1), (5, -1), "RIGHT"),
-                ("VALIGN", (0, 1), (1, -1), "MIDDLE"),  # center Day/Date merged cells vertically
-            ]
-            # NOTE: No ROWBACKGROUNDS and no per-block backgrounds
-    
-            # apply vertical merges for Day (col 0) and Date (col 1)
-            FIRST_DATA_ROW = 1  # header row is 0
-            _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
-            _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
-    
-            tbl.setStyle(TableStyle(style))
-            elems.append(tbl)
-    
-            doc.build(elems)
-            with open(tmp.name, "rb") as f:
-                pdf_bytes = f.read()
-        os.remove(tmp.name)
-        return pdf_bytes
+def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        doc = SimpleDocTemplate(
+            tmp.name,
+            pagesize=landscape(letter),
+            leftMargin=0.5 * inch,
+            rightMargin=0.5 * inch,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+        )
 
+        # Styles
+        h_style = ParagraphStyle(
+            "H",
+            fontName=PDF_FONT_BOLD,
+            fontSize=18,
+            alignment=TA_CENTER,
+            spaceAfter=28,
+            textColor=colors.HexColor("#31333f"),
+        )
+        l_style = ParagraphStyle(
+            "L",
+            fontName=PDF_FONT,
+            fontSize=10,
+            spaceAfter=10,
+            textColor=colors.HexColor("#31333f"),
+        )
+        # Wrapping style for the Work Performed column
+        wp_style = ParagraphStyle(
+            "WP",
+            fontName=PDF_FONT,
+            fontSize=9,
+            leading=11,
+            textColor=colors.HexColor("#31333f"),
+        )
 
-        # ---- helpers ----
+        total_hrs = float(df_week["Client Hours"].fillna(0).sum())
+        th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
+
+        elems = [
+            Paragraph("HCB TIMESHEET", h_style),
+            Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
+            Paragraph(f"Week of: <b>{week_monday:%B %-d, %Y}</b>", l_style),
+            Paragraph(
+                f'Total Hours: <b><font backcolor="#fffac1" color="#373737">{th}</font></b>',
+                l_style,
+            ),
+            Spacer(1, 0.18 * inch),
+        ]
+
+        display_df = df_week.copy()
+        # Ensure Work Performed exists for PDF
+        if "Work Performed" not in display_df.columns:
+            display_df["Work Performed"] = ""
+
+        def fmt_time(t):
+            if pd.isna(t):
+                return ""
+            return f"{int(t.hour):02d}:{int(t.minute):02d}"
+
+        if not display_df.empty:
+            display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
+            display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
+            display_df["End Time"] = display_df["End Time"].apply(fmt_time)
+            display_df["Client Hours"] = display_df["Client Hours"].apply(
+                lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
+            )
+            display_df["Work Performed"] = display_df["Work Performed"].fillna("").astype(str)
+
+        # Build data with new column order (Work Performed between Client and Hours)
+        headers = ["Day", "Date", "Start", "End", "Client", "Work Performed", "Hours"]
+        mapped = display_df.rename(
+            columns={
+                "Day of week": "Day",
+                "Client Name": "Client",
+                "Client Hours": "Hours",
+                "Start Time": "Start",
+                "End Time": "End",
+            }
+        )[headers].values.tolist()
+
+        # Wrap Work Performed cells
+        for row in mapped:
+            row[5] = Paragraph(row[5], wp_style)
+
+        data = [headers] + mapped
+
+        # --- helper: add vertical spans for contiguous equal values; blank duplicates
         def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
-            """Add SPANs for contiguous identical values in the given column; blank duplicates."""
             if len(data_matrix) <= first_data_row:
                 return
             r0 = first_data_row
@@ -440,35 +386,31 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
                 if (j - i) > 1 and str(vals[i]) != "":
                     style_list.append(("SPAN", (col_idx, r0 + i), (col_idx, r0 + j - 1)))
                     for k in range(i + 1, j):
-                        data_matrix[first_data_row + k][col_idx] = ""  # show value only once
+                        data_matrix[first_data_row + k][col_idx] = ""
                 i = j
 
-        def _date_runs(data_matrix, date_col_idx, first_data_row):
-            """Return [(row_start, row_end), ...] for contiguous identical Date values."""
-            runs = []
-            if len(data_matrix) <= first_data_row:
-                return runs
-            r = first_data_row
-            cur = data_matrix[r][date_col_idx]
-            start = r
-            for rr in range(r + 1, len(data_matrix)):
-                v = data_matrix[rr][date_col_idx]
-                if v != cur:
-                    runs.append((start, rr - 1))
-                    cur = v
-                    start = rr
-            runs.append((start, len(data_matrix) - 1))
-            return runs
-
+        # ----- column widths: 50% to Work Performed; other columns share the remaining 50% proportionally -----
         total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
-        col_widths = [
-            1.1 * inch,  # Day
-            1.3 * inch,  # Date
-            1.0 * inch,  # Start
-            1.0 * inch,  # End
-            total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
-            0.9 * inch,  # Hours
-        ]
+        work_w = total_width * 0.5
+        other_w = total_width - work_w  # 50%
+
+        # Base proportions from prior layout
+        base_day   = 1.1 * inch
+        base_date  = 1.3 * inch
+        base_start = 1.0 * inch
+        base_end   = 1.0 * inch
+        base_hours = 0.9 * inch
+        base_client = total_width - (base_day + base_date + base_start + base_end + base_hours)
+
+        scale = other_w / (base_day + base_date + base_start + base_end + base_client + base_hours)  # = other_w / total_width
+        day_w    = base_day * scale
+        date_w   = base_date * scale
+        start_w  = base_start * scale
+        end_w    = base_end * scale
+        client_w = base_client * scale
+        hours_w  = base_hours * scale
+
+        col_widths = [day_w, date_w, start_w, end_w, client_w, work_w, hours_w]
 
         tbl = Table(data, colWidths=col_widths, repeatRows=1)
         style = [
@@ -485,26 +427,21 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
             ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
             ("FONTSIZE", (0, 1), (-1, -1), 10),
             ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
-            ("TOPPADDING", (0, 1), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
+            ("TOPPADDING", (0, 1), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
 
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
-            ("ALIGN", (2, 1), (3, -1), "RIGHT"),
-            ("ALIGN", (5, 1), (5, -1), "RIGHT"),
-            ("VALIGN", (0, 1), (1, -1), "MIDDLE"),  # merged Day/Date cells centered vertically
+            ("ALIGN", (2, 1), (3, -1), "RIGHT"),   # Start, End
+            ("ALIGN", (6, 1), (6, -1), "RIGHT"),   # Hours (now col index 6)
+            ("VALIGN", (0, 1), (1, -1), "MIDDLE"), # merged Day/Date cells
+            ("VALIGN", (5, 1), (5, -1), "TOP"),    # Work Performed: top-align multi-line notes
         ]
-        # NOTE: intentionally NO ("ROWBACKGROUNDS", ...) here
+        # No ROWBACKGROUNDS — no striping
 
-        # ---- apply vertical merges for Day (col 0) and Date (col 1) ----
-        FIRST_DATA_ROW = 1  # header is row 0
+        # Apply vertical merges
+        FIRST_DATA_ROW = 1  # header row is 0
         _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
         _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
-
-        # ---- apply group-level zebra by Date runs (uniform fill per merged block) ----
-        alt_colors = [colors.white, colors.HexColor("#f7f8fb")]
-        runs = _date_runs(data, date_col_idx=1, first_data_row=FIRST_DATA_ROW)
-        for idx, (r_start, r_end) in enumerate(runs):
-            style.append(("BACKGROUND", (0, r_start), (-1, r_end), alt_colors[idx % 2]))
 
         tbl.setStyle(TableStyle(style))
         elems.append(tbl)
@@ -514,8 +451,6 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
             pdf_bytes = f.read()
     os.remove(tmp.name)
     return pdf_bytes
-
-
 
 # =========================
 # UI
@@ -564,7 +499,7 @@ if files:
         st.stop()
 
     enable_edit = st.checkbox(
-        "Enable inline edits (Client / Hours / Work Performed)",  # <— UPDATED label
+        "Enable inline edits (Client / Hours / Work Performed)",
         value=False,
         help="Start/End times derive from segments and are not editable here.",
     )
@@ -577,10 +512,10 @@ if files:
         mask = detailed_all["Date"].between(days[0], days[-1])
         df_week = detailed_all.loc[mask].copy()
 
-        # ---- consolidate contiguous same-client blocks before placeholders ----
+        # consolidate contiguous same-client blocks before placeholders
         df_week = consolidate_contiguous(df_week)
 
-        # --- NEW: ensure Work Performed column exists (blank by default) ---
+        # ensure Work Performed column exists (blank by default)
         if "Work Performed" not in df_week.columns:
             df_week["Work Performed"] = ""
 
@@ -600,7 +535,7 @@ if files:
                                     "End Time": pd.NaT,
                                     "Client Name": np.nan,
                                     "Client Hours": np.nan,
-                                    "Work Performed": ""   # <— include new column in placeholder
+                                    "Work Performed": ""
                                 }
                             ]
                         ),
@@ -620,11 +555,11 @@ if files:
                 hide_index=True,
                 column_config={
                     "Client Hours": st.column_config.NumberColumn(label="Client Hours", min_value=0.0, step=0.25),
-                    "Work Performed": st.column_config.TextColumn(width="large"),  # <— EDITABLE
+                    "Work Performed": st.column_config.TextColumn(width="large"),
                 },
                 disabled=["Day of week", "Date", "Start Time", "End Time", "Client Name"],
             )
-            # Normalize hours rounding up to quarter-hour (unchanged)
+            # Normalize hours rounding up to quarter-hour
             edited["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_h(x) if pd.notna(x) and x != "" else x)
             render_df = edited
         else:
@@ -652,7 +587,8 @@ if files:
             key=f"csv_{wk}",
         )
 
-        pdf_bytes = export_pdf_detailed(render_df.drop(columns=["Work Performed"], errors="ignore"), wk, employee_name=employee_name)
+        # IMPORTANT: pass full DF (with Work Performed) to PDF
+        pdf_bytes = export_pdf_detailed(render_df, wk, employee_name=employee_name)
         st.download_button(
             label=f"Download PDF (Week of {wk:%Y-%m-%d})",
             data=pdf_bytes,
