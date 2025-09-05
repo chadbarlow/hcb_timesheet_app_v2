@@ -102,7 +102,11 @@ def clamp(df):
     return df.assign(dur_hr=(df["ce"] - df["cs"]).dt.total_seconds() / 3600)
 
 def build_segs(df):
-    """Build clamped event segments + same-day gaps. Also add pre-8am gap if first segment starts after 08:00."""
+    """
+    Build clamped event segments + same-day gaps between events.
+    NEW: For each day, if the first clamped segment starts AFTER 08:00,
+    insert a leading gap [08:00 -> first_cs] and mark it to force owner='Not Billable'.
+    """
     if df.empty:
         return []
     df = df.sort_values("cs").copy()
@@ -115,21 +119,32 @@ def build_segs(df):
         eight = datetime.datetime.combine(day, datetime.time(8, 0))
         first_cs = recs[0]["cs"]
         if first_cs > eight:
-            segs.append({"s": eight, "e": first_cs, "dur": (first_cs - eight).total_seconds()/3600.0,
-                         "ot": None, "dt": None, "on": None, "dn": None, "force_other": True})
+            segs.append({
+                "s": eight, "e": first_cs,
+                "dur": (first_cs - eight).total_seconds()/3600.0,
+                "ot": None, "dt": None, "on": None, "dn": None,
+                "force_other": True  # flag picked up by allocator; means "Not Billable"
+            })
         for p, c in zip(recs, recs[1:]):
             segs.append({"s": p["cs"], "e": p["ce"], "dur": p["dur_hr"],
-                         "ot": p["ot"], "dt": p["dt"], "on": p["origin"], "dn": p["destin"], "force_other": False})
+                         "ot": p["ot"], "dt": p["dt"], "on": p["origin"], "dn": p["destin"],
+                         "force_other": False})
             if p["ce"].date() == c["cs"].date() and c["cs"] > p["ce"]:
-                segs.append({"s": p["ce"], "e": c["cs"], "dur": (c["cs"] - p["ce"]).total_seconds()/3600.0,
-                             "ot": p["dt"], "dt": c["ot"], "on": p["destin"], "dn": c["origin"], "force_other": False})
+                segs.append({"s": p["ce"], "e": c["cs"],
+                             "dur": (c["cs"] - p["ce"]).total_seconds()/3600.0,
+                             "ot": p["dt"], "dt": c["ot"], "on": p["destin"], "dn": c["origin"],
+                             "force_other": False})
         l = recs[-1]
         segs.append({"s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
-                     "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"], "force_other": False})
+                     "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"],
+                     "force_other": False})
     return segs
 
 def alloc_detailed(segs):
-    """Produce detailed rows from segments (rounded to nearest 0.25h for bounds; hours = exact diff)."""
+    """
+    Produce detailed rows from segments (rounded to nearest 0.25h for bounds; hours = exact diff).
+    Segments marked with force_other=True are always labeled 'Not Billable'.
+    """
     cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]
     if not segs:
         return pd.DataFrame(columns=cols)
@@ -139,11 +154,12 @@ def alloc_detailed(segs):
     e_ts = [s["e"] for s in arr]
     rows = []
     for s in segs:
+        # owner inference
         if s.get("force_other"):
-            owner = "Other"
+            owner = "Not Billable"
         else:
             if any("sittler" in str(n).lower() for n in [s.get("on"), s.get("dn"), s.get("ot"), s.get("dt")]):
-                owner = "Other"
+                owner = "Not Billable"
             elif s.get("ot") == "Homeowner":
                 owner = s.get("on")
             elif s.get("dt") == "Homeowner":
@@ -153,15 +169,20 @@ def alloc_detailed(segs):
                 h1 = arr[i - 1]["dn"] if i > 0 else None
                 j = bisect.bisect_left(s_ts, s["e"])
                 h2 = dep[j]["on"] if j < len(s_ts) else None
-                owner = h1 or h2 or "Other"
+                owner = h1 or h2 or "Not Billable"
         rs = round_to_quarter(s["s"])
         re = round_to_quarter(s["e"])
         if re <= rs:
             continue
         hours = (re - rs).total_seconds() / 3600.0
-        rows.append({"Day of week": rs.strftime("%A"), "Date": rs.date(),
-                     "Start Time": rs.time(), "End Time": re.time(),
-                     "Client Name": owner, "Client Hours": hours})
+        rows.append({
+            "Day of week": rs.strftime("%A"),
+            "Date": rs.date(),
+            "Start Time": rs.time(),
+            "End Time": re.time(),
+            "Client Name": owner,
+            "Client Hours": hours,
+        })
     df = pd.DataFrame(rows, columns=cols)
     if not df.empty:
         df = df.sort_values(["Date", "Start Time"]).reset_index(drop=True)
@@ -262,23 +283,19 @@ def detailed_from_revised_text(text: str) -> pd.DataFrame:
     except Exception:
         df_raw = pd.read_csv(StringIO(text), encoding="latin-1")
     df_norm = _normalize_revised_csv(df_raw)
-    # Convert to internal schema columns
     day = df_norm["Day"].astype(str).fillna("")
     date = df_norm["Date"].apply(_parse_date_to_dateobj)
     start_t = df_norm["Start"].apply(_parse_time_to_timeobj)
     end_t   = df_norm["End"].apply(_parse_time_to_timeobj)
     client = df_norm["Client"].astype(str)
-    # Hours numeric if possible
     def _h(x):
         try:
-            v = float(x)
-            return v
+            v = float(x); return v
         except Exception:
             return np.nan
     hours = df_norm["Hours"].apply(_h)
     work = df_norm["Work Performed"].fillna("").astype(str)
 
-    # If day is missing/empty, regenerate from date
     def _dow(d, fallback):
         if pd.isna(d):
             return fallback or ""
@@ -294,7 +311,6 @@ def detailed_from_revised_text(text: str) -> pd.DataFrame:
         "Client Hours": hours,
         "Work Performed": work,
     })
-    # Drop rows without a real Date or Start/End if both missing
     out = out[~out["Date"].isna()].copy()
     out = out.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
     return out
@@ -304,7 +320,6 @@ def detailed_from_revised_text(text: str) -> pd.DataFrame:
 # =========================
 def ingest_file_to_detailed(file_obj) -> pd.DataFrame:
     """Return a detailed DataFrame from an uploaded file, regardless of format."""
-    # Read the entire upload to text once (robust to encoding)
     try:
         content = file_obj.read()
     finally:
@@ -312,32 +327,26 @@ def ingest_file_to_detailed(file_obj) -> pd.DataFrame:
             file_obj.seek(0)
         except Exception:
             pass
-    # Try utf-8 first, then latin-1
     try:
         text = content.decode("utf-8")
     except Exception:
         text = content.decode("latin-1")
 
-    # Heuristic: MileIQ if any line contains START_DATE*
     if "START_DATE*" in text:
         try:
             df = load_clean_from_text(file_obj.name, text)
         except ValueError:
-            # If oddly formatted, fall back to revised path
             return detailed_from_revised_text(text)
         df = parse_ts(df)
         df = extract_sites(df)
         df = clamp(df)
         segs = build_segs(df)
         detailed = alloc_detailed(segs)
-        # ensure Work Performed exists
         if "Work Performed" not in detailed.columns:
             detailed["Work Performed"] = ""
         return detailed
 
-    # Otherwise treat as Revised/Already-Detailed CSV
     detailed = detailed_from_revised_text(text)
-    # Fill missing Work Performed
     if "Work Performed" not in detailed.columns:
         detailed["Work Performed"] = ""
     return detailed
@@ -487,7 +496,6 @@ def _render_pipeline(file_list, section_key_prefix=""):
     if not file_list:
         return
 
-    # Build combined detailed rows across all files (MileIQ or Revised)
     detailed_frames = []
     for f in file_list:
         try:
@@ -499,14 +507,12 @@ def _render_pipeline(file_list, section_key_prefix=""):
         return
 
     detailed_all = pd.concat(detailed_frames, ignore_index=True)
-    # Ensure dtypes and columns
     for col in ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]:
         if col not in detailed_all.columns:
             detailed_all[col] = pd.NA
     if "Work Performed" not in detailed_all.columns:
         detailed_all["Work Performed"] = ""
 
-    # Determine available weeks
     weeks = find_weeks(detailed_all["Date"].dropna().unique())
     if not weeks:
         st.warning("Could not infer week(s) from dates in the uploaded files.")
@@ -538,101 +544,10 @@ def _render_pipeline(file_list, section_key_prefix=""):
         mask = detailed_all["Date"].between(days[0], days[-1])
         df_week = detailed_all.loc[mask].copy()
 
-        # Consolidate contiguous same-client blocks before placeholders
         df_week = consolidate_contiguous(df_week)
 
-        # Ensure Work Performed column exists (blank by default)
         if "Work Performed" not in df_week.columns:
             df_week["Work Performed"] = ""
 
-        # Ensure at least one placeholder row per weekday (if empty)
         present = set(df_week["Date"].dropna().unique())
-        for d in days:
-            if d not in present:
-                df_week = pd.concat(
-                    [
-                        df_week,
-                        pd.DataFrame([{
-                            "Day of week": d.strftime("%A"), "Date": d,
-                            "Start Time": pd.NaT, "End Time": pd.NaT,
-                            "Client Name": np.nan, "Client Hours": np.nan,
-                            "Work Performed": ""
-                        }])
-                    ],
-                    ignore_index=True,
-                )
-
-        df_week = df_week.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
-
-        if enable_edit:
-            edited = st.data_editor(
-                df_week,
-                key=f"{section_key_prefix}edit_{wk}",
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Client Hours": st.column_config.NumberColumn(label="Client Hours", min_value=0.0, step=0.25),
-                    "Work Performed": st.column_config.TextColumn(width="large"),
-                },
-                disabled=["Day of week", "Date", "Start Time", "End Time", "Client Name"],
-            )
-            edited["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_h(x) if pd.notna(x) and x != "" else x)
-            render_df = edited
-        else:
-            render_df = df_week
-
-        total_h = float(render_df["Client Hours"].fillna(0).sum())
-        th_str = int(total_h) if total_h == int(total_h) else round(total_h, 2)
-        st.markdown(
-            f"**Total Hours:** "
-            f"<span style='background:#fffac1;color:#373737;padding:2px 6px;border-radius:4px;'>{th_str}</span>",
-            unsafe_allow_html=True,
-        )
-
-        st.dataframe(render_df, use_container_width=True)
-
-        csv_bytes = render_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label=f"Download CSV (Week of {wk:%Y-%m-%d})",
-            data=csv_bytes,
-            file_name=f"Detailed_Segments_{wk:%Y-%m-%d}.csv",
-            mime="text/csv",
-            key=f"{section_key_prefix}csv_{wk}",
-        )
-
-        pdf_bytes = export_pdf_detailed(render_df, wk, employee_name=employee_name)
-        st.download_button(
-            label=f"Download PDF (Week of {wk:%Y-%m-%d})",
-            data=pdf_bytes,
-            file_name=f"HCB_Timesheet_Detailed_{wk:%Y-%m-%d}.pdf",
-            mime="application/pdf",
-            key=f"{section_key_prefix}pdf_{wk}",
-        )
-
-        b64 = base64.b64encode(pdf_bytes).decode()
-        st.markdown(
-            f"""
-            <object data="data:application/pdf;base64,{b64}" type="application/pdf" width="100%" height="800px">
-                <embed src="data:application/pdf;base64,{b64}" type="application/pdf"/>
-            </object>
-            """,
-            unsafe_allow_html=True,
-        )
-
-# =========================
-# UI sections
-# =========================
-st.set_page_config(layout="wide")
-
-# Main (usual) uploader — now accepts MileIQ or Revised
-st.subheader("Upload MileIQ CSVs (or detailed CSVs); duplicates ignored")
-files = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True, key="main_files")
-if files:
-    _render_pipeline(files, section_key_prefix="main_")
-
-# Revised section — same processing
-st.markdown("---")
-st.header("Revised CSV — Process & Format (same as usual)")
-revised_files = st.file_uploader("Upload revised CSVs", type=["csv"], accept_multiple_files=True, key="revised_files")
-if revised_files:
-    _render_pipeline(revised_files, section_key_prefix="rev_")
+        for d in d
