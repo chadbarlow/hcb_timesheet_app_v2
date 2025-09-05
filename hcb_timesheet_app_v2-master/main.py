@@ -430,7 +430,7 @@ if files:
         st.stop()
 
     enable_edit = st.checkbox(
-        "Enable inline edits (Client / Hours)",
+        "Enable inline edits (Client / Hours / Work Performed)",  # <— UPDATED label
         value=False,
         help="Start/End times derive from segments and are not editable here.",
     )
@@ -443,8 +443,12 @@ if files:
         mask = detailed_all["Date"].between(days[0], days[-1])
         df_week = detailed_all.loc[mask].copy()
 
-        # ---- NEW: consolidate contiguous same-client blocks before placeholders ----
+        # ---- consolidate contiguous same-client blocks before placeholders ----
         df_week = consolidate_contiguous(df_week)
+
+        # --- NEW: ensure Work Performed column exists (blank by default) ---
+        if "Work Performed" not in df_week.columns:
+            df_week["Work Performed"] = ""
 
         # Ensure at least one placeholder row per weekday (if empty)
         present = set(df_week["Date"].dropna().unique())
@@ -462,6 +466,7 @@ if files:
                                     "End Time": pd.NaT,
                                     "Client Name": np.nan,
                                     "Client Hours": np.nan,
+                                    "Work Performed": ""   # <— include new column in placeholder
                                 }
                             ]
                         ),
@@ -481,10 +486,11 @@ if files:
                 hide_index=True,
                 column_config={
                     "Client Hours": st.column_config.NumberColumn(label="Client Hours", min_value=0.0, step=0.25),
+                    "Work Performed": st.column_config.TextColumn(width="large"),  # <— EDITABLE
                 },
-                disabled=["Day of week", "Date", "Start Time", "End Time"],
+                disabled=["Day of week", "Date", "Start Time", "End Time", "Client Name"],
             )
-            # Normalize hours rounding up to quarter-hour
+            # Normalize hours rounding up to quarter-hour (unchanged)
             edited["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_h(x) if pd.notna(x) and x != "" else x)
             render_df = edited
         else:
@@ -502,9 +508,8 @@ if files:
         # Display
         st.dataframe(render_df, use_container_width=True)
 
-
         # Downloads: CSV + PDF + inline preview
-        csv_bytes = render_df.to_csv(index=False).encode("utf-8")
+        csv_bytes = render_df.to_csv(index=False).encode("utf-8")  # includes Work Performed
         st.download_button(
             label=f"Download CSV (Week of {wk:%Y-%m-%d})",
             data=csv_bytes,
@@ -513,7 +518,7 @@ if files:
             key=f"csv_{wk}",
         )
 
-        pdf_bytes = export_pdf_detailed(render_df, wk, employee_name=employee_name)
+        pdf_bytes = export_pdf_detailed(render_df.drop(columns=["Work Performed"], errors="ignore"), wk, employee_name=employee_name)
         st.download_button(
             label=f"Download PDF (Week of {wk:%Y-%m-%d})",
             data=pdf_bytes,
