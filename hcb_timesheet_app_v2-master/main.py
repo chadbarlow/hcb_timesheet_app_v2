@@ -19,7 +19,17 @@ from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
+# Charting (ReportLab graphics)
+from reportlab.graphics.shapes import Drawing, String
+from reportlab.graphics.charts.barcharts import HorizontalBarChart
+
 from reportlab.lib.enums import TA_CENTER
+
+# =========================
+# Streamlit page config
+# =========================
+st.set_page_config(layout="wide")
 
 # =========================
 # Font setup (graceful fallback)
@@ -154,7 +164,6 @@ def alloc_detailed(segs):
     e_ts = [s["e"] for s in arr]
     rows = []
     for s in segs:
-        # owner inference
         if s.get("force_other"):
             owner = "Not Billable"
         else:
@@ -352,8 +361,7 @@ def ingest_file_to_detailed(file_obj) -> pd.DataFrame:
     return detailed
 
 # =========================
-# Styled PDF (merged Day/Date, no zebra, Work Performed 50%, short Mon / MM-DD)
-# + Summary table (Client | Hours) appended after the detailed table
+# PDF Export (detail table + summary table + bar chart)
 # =========================
 def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -366,23 +374,23 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             bottomMargin=0.5 * inch,
         )
         # Styles
-        h_style = ParagraphStyle("H", fontName=PDF_FONT_BOLD, fontSize=18, alignment=TA_CENTER,
-                                 spaceAfter=28, textColor=colors.HexColor("#31333f"))
-        l_style = ParagraphStyle("L", fontName=PDF_FONT, fontSize=10, spaceAfter=10,
-                                 textColor=colors.HexColor("#31333f"))
-        wp_style = ParagraphStyle("WP", fontName=PDF_FONT, fontSize=9, leading=11,
-                                  textColor=colors.HexColor("#31333f"))
-        subhead_style = ParagraphStyle("SH", fontName=PDF_FONT_BOLD, fontSize=12,
-                                       spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#31333f"))
+        H = ParagraphStyle("H", fontName=PDF_FONT_BOLD, fontSize=18, alignment=TA_CENTER,
+                           spaceAfter=28, textColor=colors.HexColor("#31333f"))
+        L = ParagraphStyle("L", fontName=PDF_FONT, fontSize=10, spaceAfter=10,
+                           textColor=colors.HexColor("#31333f"))
+        WP = ParagraphStyle("WP", fontName=PDF_FONT, fontSize=9, leading=11,
+                            textColor=colors.HexColor("#31333f"))
+        SH = ParagraphStyle("SH", fontName=PDF_FONT_BOLD, fontSize=12,
+                            spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#31333f"))
 
         total_hrs = float(df_week["Client Hours"].fillna(0).sum())
         th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
 
         elems = [
-            Paragraph("HCB TIMESHEET", h_style),
-            Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
-            Paragraph(f"Week of: <b>{week_monday:%B %-d, %Y}</b>", l_style),
-            Paragraph(f'Total Hours: <b><font backcolor="#fffac1" color="#373737">{th}</font></b>', l_style),
+            Paragraph("HCB TIMESHEET", H),
+            Paragraph(f"Employee: <b>{employee_name}</b>", L),
+            Paragraph(f"Week of: <b>{week_monday:%B %-d, %Y}</b>", L),
+            Paragraph(f'Total Hours: <b><font backcolor="#fffac1" color="#373737">{th}</font></b>', L),
             Spacer(1, 0.18 * inch),
         ]
 
@@ -417,7 +425,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
         })
         mapped = df_for_pdf[headers].values.tolist()
         for row in mapped:
-            row[5] = Paragraph(str(row[5]), wp_style)
+            row[5] = Paragraph(str(row[5]), WP)
         data = [headers] + mapped
 
         def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
@@ -482,7 +490,6 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
         elems.append(tbl)
 
         # ===== Summary table: Client | Hours =====
-        # Build from the *numeric* hours before PDF formatting (use df_week directly).
         sum_work = df_week.copy()
         sum_work["_hrs"] = pd.to_numeric(sum_work["Client Hours"], errors="coerce").fillna(0.0)
         sum_work["_client"] = sum_work["Client Name"].fillna("").astype(str)
@@ -490,27 +497,23 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             sum_work.groupby("_client", as_index=False)["_hrs"].sum()
             .rename(columns={"_client": "Client", "_hrs": "Hours"})
         )
-        # Drop zero-hour rows (e.g., placeholders)
         summary = summary[summary["Hours"] > 0].copy()
-        # Sort by hours desc, then client asc
         summary = summary.sort_values(["Hours", "Client"], ascending=[False, True]).reset_index(drop=True)
-        # Format Hours for display: int if whole else 2 decimals
+
         def _fmt_h(v):
             return int(v) if float(v) == int(v) else round(float(v), 2)
         summary["Hours"] = summary["Hours"].apply(_fmt_h)
 
         if not summary.empty:
             elems.append(Spacer(1, 0.22 * inch))
-            elems.append(Paragraph("Summary by Client", subhead_style))
+            elems.append(Paragraph("Summary by Client", SH))
 
             sum_headers = ["Client", "Hours"]
             sum_data = [sum_headers] + summary[sum_headers].values.tolist()
 
-            # Column widths: ~75% / 25% of available width
             client_w2 = total_width * 0.75
             hours_w2 = total_width - client_w2
             tbl_sum = Table(sum_data, colWidths=[client_w2, hours_w2], repeatRows=1)
-
             sum_style = [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
@@ -532,6 +535,60 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             tbl_sum.setStyle(TableStyle(sum_style))
             elems.append(tbl_sum)
 
+            # ===== Horizontal Bar Chart =====
+            # Use the same sorted data as the summary table
+            cats = summary["Client"].tolist()
+            vals = summary["Hours"].astype(float).tolist()
+
+            # Dynamic sizing: ~14pt per bar + margins
+            bar_height = 14
+            top_margin = 20
+            bottom_margin = 20
+            left_margin = 120  # space for category labels
+            right_margin = 40
+            chart_h = max(60, bar_height * len(cats) + top_margin + bottom_margin)
+            chart_w = total_width
+
+            d = Drawing(chart_w, chart_h)
+
+            # Title-like label (optional)
+            d.add(String(0, chart_h - 12, "", fontName=PDF_FONT_BOLD, fontSize=10))
+
+            # Chart area
+            ch = HorizontalBarChart()
+            ch.x = left_margin
+            ch.y = bottom_margin
+            ch.width = chart_w - left_margin - right_margin
+            ch.height = chart_h - top_margin - bottom_margin
+
+            ch.data = [vals]
+            ch.categoryAxis.categoryNames = cats
+
+            # Axes style
+            ch.valueAxis.strokeColor = colors.HexColor("#999999")
+            ch.valueAxis.labels.fontName = PDF_FONT
+            ch.valueAxis.labels.fontSize = 8
+            ch.categoryAxis.labels.fontName = PDF_FONT
+            ch.categoryAxis.labels.fontSize = 8
+
+            # Extend x-axis max a bit above max value for padding
+            vmax = max(vals) if vals else 0
+            ch.valueAxis.valueMin = 0
+            ch.valueAxis.valueMax = vmax * 1.1 if vmax > 0 else 1
+            ch.valueAxis.visibleGrid = True
+            ch.valueAxis.gridStrokeColor = colors.HexColor("#e4e5e8")
+
+            # Bars styling
+            ch.bars[0].fillColor = colors.HexColor("#5B8FF9")  # calm blue
+            ch.bars.strokeColor = colors.HexColor("#4a4a4a")
+            ch.barWidth = max(6, int(bar_height * 0.7))
+            ch.groupSpacing = 4
+            ch.categoryAxis.reverseDirection = 1  # largest at top (since sorted desc)
+
+            d.add(ch)
+            elems.append(Spacer(1, 0.15 * inch))
+            elems.append(d)
+
         # ---- Build the PDF ----
         doc.build(elems)
         with open(tmp.name, "rb") as f:
@@ -542,8 +599,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 # =========================
 # UI & shared render
 # =========================
-st.set_page_config(layout="wide")
-st.title("MileIQ Billables ➜ Detailed Weekly Schedule (Merged Blocks + Styled PDF)")
+st.title("MileIQ Billables ➜ Detailed Weekly Schedule (Merged Blocks + Styled PDF + Summary Chart)")
 
 employee_name = st.text_input("Employee name (for PDF header)", value="Chad Barlow")
 
@@ -681,7 +737,6 @@ def _render_pipeline(file_list, section_key_prefix=""):
 # =========================
 # UI sections
 # =========================
-st.set_page_config(layout="wide")
 st.subheader("Upload MileIQ CSVs (or detailed CSVs); duplicates ignored")
 files = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True, key="main_files")
 if files:
