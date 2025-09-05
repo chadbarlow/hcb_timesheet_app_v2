@@ -99,80 +99,99 @@ def clamp(df):
     return df.assign(dur_hr=(df["ce"] - df["cs"]).dt.total_seconds() / 3600)
 
 def build_segs(df):
-    segs, recs = [], df.to_dict("records")
-    if not recs:
+    """
+    Build clamped event segments + same-day gaps between events.
+    NEW: For each day, if the first clamped segment starts AFTER 08:00,
+    insert a leading gap [08:00 -> first_cs] and mark it to force owner='Other'.
+    """
+    if df.empty:
         return []
-    for p, c in zip(recs, recs[1:]):
-        # clamped event segment
-        segs.append(
-            {
-                "s": p["cs"],
-                "e": p["ce"],
-                "dur": p["dur_hr"],
-                "ot": p["ot"],
-                "dt": p["dt"],
-                "on": p["origin"],
-                "dn": p["destin"],
-            }
-        )
-        # same-day gap segment (covers travel/idle)
-        if p["ce"].date() == c["cs"].date() and c["cs"] > p["ce"]:
-            segs.append(
-                {
-                    "s": p["ce"],
-                    "e": c["cs"],
-                    "dur": (c["cs"] - p["ce"]).total_seconds() / 3600,
-                    "ot": p["dt"],
-                    "dt": c["ot"],
-                    "on": p["destin"],
-                    "dn": c["origin"],
-                }
-            )
-    l = recs[-1]
-    segs.append(
-        {
-            "s": l["cs"],
-            "e": l["ce"],
-            "dur": l["dur_hr"],
-            "ot": l["ot"],
-            "dt": l["dt"],
-            "on": l["origin"],
-            "dn": l["destin"],
-        }
-    )
+
+    # Ensure sorted and group by calendar day of the clamped start
+    df = df.sort_values("cs").copy()
+    df["_day"] = df["cs"].dt.date
+
+    segs = []
+    for day, g in df.groupby("_day"):
+        recs = list(g.to_dict("records"))
+        if not recs:
+            continue
+
+        # --- NEW: pre-8am → first drive gap (forced 'Other') ---
+        eight = datetime.datetime.combine(day, datetime.time(8, 0))
+        first_cs = recs[0]["cs"]
+        if first_cs > eight:
+            segs.append({
+                "s": eight,
+                "e": first_cs,
+                "dur": (first_cs - eight).total_seconds() / 3600.0,
+                "ot": None, "dt": None, "on": None, "dn": None,
+                "force_other": True   # <— flag picked up by allocator
+            })
+
+        # --- Normal segments + in-day gaps ---
+        for p, c in zip(recs, recs[1:]):
+            # event segment
+            segs.append({
+                "s": p["cs"], "e": p["ce"], "dur": p["dur_hr"],
+                "ot": p["ot"], "dt": p["dt"], "on": p["origin"], "dn": p["destin"],
+                "force_other": False
+            })
+            # gap between same-day events
+            if p["ce"].date() == c["cs"].date() and c["cs"] > p["ce"]:
+                segs.append({
+                    "s": p["ce"], "e": c["cs"],
+                    "dur": (c["cs"] - p["ce"]).total_seconds() / 3600.0,
+                    "ot": p["dt"], "dt": c["ot"], "on": p["destin"], "dn": c["origin"],
+                    "force_other": False
+                })
+
+        # last event of the day
+        l = recs[-1]
+        segs.append({
+            "s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
+            "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"],
+            "force_other": False
+        })
+
     return segs
+
 
 def alloc_detailed(segs):
     """
-    Returns a flat table with columns:
-    Day of week | Date | Start Time | End Time | Client Name | Client Hours
-    - Client Hours are rounded UP to the nearest 0.25h
-    - Start/End times remain as clamped event/gap boundaries
+    Returns a flat table:
+      Day of week | Date | Start Time | End Time | Client Name | Client Hours
+    - Client Hours rounded UP to nearest 0.25h
+    - NEW: segments marked with force_other=True are always 'Other'
     """
     cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]
     if not segs:
         return pd.DataFrame(columns=cols)
 
-    dep = sorted([s for s in segs if s["ot"] == "Homeowner"], key=lambda x: x["s"])
-    arr = sorted([s for s in segs if s["dt"] == "Homeowner"], key=lambda x: x["e"])
+    dep = sorted([s for s in segs if s.get("ot") == "Homeowner"], key=lambda x: x["s"])
+    arr = sorted([s for s in segs if s.get("dt") == "Homeowner"], key=lambda x: x["e"])
     s_ts = [s["s"] for s in dep]
     e_ts = [s["e"] for s in arr]
 
     rows = []
     for s in segs:
-        # owner selection
-        if any("sittler" in str(n).lower() for n in [s["on"], s["dn"], s["ot"], s["dt"]]):
+        # --- NEW: forced Other (e.g., pre-8am gap) ---
+        if s.get("force_other"):
             owner = "Other"
-        elif s["ot"] == "Homeowner":
-            owner = s["on"]
-        elif s["dt"] == "Homeowner":
-            owner = s["dn"]
         else:
-            i = bisect.bisect_right(e_ts, s["s"])
-            h1 = arr[i - 1]["dn"] if i > 0 else None
-            j = bisect.bisect_left(s_ts, s["e"])
-            h2 = dep[j]["on"] if j < len(s_ts) else None
-            owner = h1 or h2 or "Other"
+            # existing owner logic
+            if any("sittler" in str(n).lower() for n in [s.get("on"), s.get("dn"), s.get("ot"), s.get("dt")]):
+                owner = "Other"
+            elif s.get("ot") == "Homeowner":
+                owner = s.get("on")
+            elif s.get("dt") == "Homeowner":
+                owner = s.get("dn")
+            else:
+                i = bisect.bisect_right(e_ts, s["s"])
+                h1 = arr[i - 1]["dn"] if i > 0 else None
+                j = bisect.bisect_left(s_ts, s["e"])
+                h2 = dep[j]["on"] if j < len(s_ts) else None
+                owner = h1 or h2 or "Other"
 
         if s["e"] > s["s"]:
             dur = r_q_h((s["e"] - s["s"]).total_seconds() / 3600.0)
@@ -191,6 +210,7 @@ def alloc_detailed(segs):
     if not df.empty:
         df = df.sort_values(["Date", "Start Time"]).reset_index(drop=True)
     return df
+
 
 # =========================
 # NEW: Consolidate contiguous same-client rows
