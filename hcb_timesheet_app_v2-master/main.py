@@ -173,12 +173,12 @@ def build_segs(df):
 def alloc_detailed(segs):
     """
     Returns a flat table:
-      Day of week | Date | Start Time | End Time | Client Name | Client Hours | Work Performed
+      Day of week | Date | Start Time | End Time | Client Name | Client Hours
     - Start/End are rounded to the nearest 0.25h.
     - Client Hours = exact (End - Start) in hours (no rounding).
     - Segments marked with force_other=True are always 'Other'.
     """
-    cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours", "Work Performed"]
+    cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]
     if not segs:
         return pd.DataFrame(columns=cols)
 
@@ -222,7 +222,6 @@ def alloc_detailed(segs):
                 "End Time": re.time(),
                 "Client Name": owner,
                 "Client Hours": hours,
-                "Work Performed": ""  # <-- included here
             }
         )
 
@@ -285,10 +284,6 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
     non_merge = df[df["Start Time"].isna() | df["End Time"].isna() | df["Client Name"].isna()]
     out = pd.concat([cons, non_merge], ignore_index=True)
     out = out.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
-
-    # Ensure column exists after concat
-    if "Work Performed" not in out.columns:
-        out["Work Performed"] = ""
     return out
 
 
@@ -337,7 +332,6 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             Spacer(1, 0.18 * inch),
         ]
 
-        # --- Table data with Work Performed included ---
         display_df = df_week.copy()
 
         def fmt_time(t):
@@ -352,10 +346,8 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             display_df["Client Hours"] = display_df["Client Hours"].apply(
                 lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
             )
-            if "Work Performed" not in display_df.columns:
-                display_df["Work Performed"] = ""
 
-        headers = ["Day", "Date", "Start", "End", "Client", "Hours", "Work Performed"]
+        headers = ["Day", "Date", "Start", "End", "Client", "Hours"]
         data = [headers] + display_df.rename(
             columns={
                 "Day of week": "Day",
@@ -368,13 +360,12 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 
         total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
         col_widths = [
-            1.0 * inch,  # Day
-            1.1 * inch,  # Date
-            0.9 * inch,  # Start
-            0.9 * inch,  # End
-            2.6 * inch,  # Client
-            0.8 * inch,  # Hours
-            total_width - (1.0 + 1.1 + 0.9 + 0.9 + 2.6 + 0.8) * inch,  # Work Performed (flex)
+            1.1 * inch,  # Day
+            1.3 * inch,  # Date
+            1.0 * inch,  # Start
+            1.0 * inch,  # End
+            total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
+            0.9 * inch,  # Hours
         ]
 
         tbl = Table(data, colWidths=col_widths, repeatRows=1)
@@ -455,7 +446,7 @@ if files:
         st.stop()
 
     enable_edit = st.checkbox(
-        "Enable inline edits (Client / Hours / Work Performed)",
+        "Enable inline edits (Client / Hours / Work Performed)",  # <— UPDATED label
         value=False,
         help="Start/End times derive from segments and are not editable here.",
     )
@@ -468,10 +459,10 @@ if files:
         mask = detailed_all["Date"].between(days[0], days[-1])
         df_week = detailed_all.loc[mask].copy()
 
-        # consolidate contiguous same-client blocks before placeholders
+        # ---- consolidate contiguous same-client blocks before placeholders ----
         df_week = consolidate_contiguous(df_week)
 
-        # ensure Work Performed column exists (blank by default)
+        # --- NEW: ensure Work Performed column exists (blank by default) ---
         if "Work Performed" not in df_week.columns:
             df_week["Work Performed"] = ""
 
@@ -491,7 +482,7 @@ if files:
                                     "End Time": pd.NaT,
                                     "Client Name": np.nan,
                                     "Client Hours": np.nan,
-                                    "Work Performed": ""
+                                    "Work Performed": ""   # <— include new column in placeholder
                                 }
                             ]
                         ),
@@ -511,11 +502,11 @@ if files:
                 hide_index=True,
                 column_config={
                     "Client Hours": st.column_config.NumberColumn(label="Client Hours", min_value=0.0, step=0.25),
-                    "Work Performed": st.column_config.TextColumn(width="large"),
+                    "Work Performed": st.column_config.TextColumn(width="large"),  # <— EDITABLE
                 },
                 disabled=["Day of week", "Date", "Start Time", "End Time", "Client Name"],
             )
-            # (Keeping your existing normalization line, though hours now come from End-Start exactly)
+            # Normalize hours rounding up to quarter-hour (unchanged)
             edited["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_h(x) if pd.notna(x) and x != "" else x)
             render_df = edited
         else:
@@ -543,8 +534,7 @@ if files:
             key=f"csv_{wk}",
         )
 
-        # Pass the full dataframe (with Work Performed) into the PDF builder
-        pdf_bytes = export_pdf_detailed(render_df, wk, employee_name=employee_name)
+        pdf_bytes = export_pdf_detailed(render_df.drop(columns=["Work Performed"], errors="ignore"), wk, employee_name=employee_name)
         st.download_button(
             label=f"Download PDF (Week of {wk:%Y-%m-%d})",
             data=pdf_bytes,
