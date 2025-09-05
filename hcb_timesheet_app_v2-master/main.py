@@ -358,29 +358,40 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             }
         )[headers].values.tolist()
 
-        # --- helper to add vertical spans on contiguous equal values in a column ---
+        # ---- helpers ----
         def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
-            """
-            Adds ('SPAN', ...) entries for contiguous identical values in column col_idx,
-            starting at table row 'first_data_row'. Also blanks the duplicate cells so only
-            the top cell in the span shows text.
-            """
+            """Add SPANs for contiguous identical values in the given column; blank duplicates."""
             if len(data_matrix) <= first_data_row:
                 return
-            r = first_data_row
+            r0 = first_data_row
             vals = [row[col_idx] for row in data_matrix[first_data_row:]]
             i = 0
             while i < len(vals):
                 j = i + 1
                 while j < len(vals) and vals[j] == vals[i]:
                     j += 1
-                # span only if there are >=2 contiguous identical values and not empty string
                 if (j - i) > 1 and str(vals[i]) != "":
-                    style_list.append(("SPAN", (col_idx, r + i), (col_idx, r + j - 1)))
-                    # blank duplicates inside the span (keep the first)
+                    style_list.append(("SPAN", (col_idx, r0 + i), (col_idx, r0 + j - 1)))
                     for k in range(i + 1, j):
-                        data_matrix[first_data_row + k][col_idx] = ""
+                        data_matrix[first_data_row + k][col_idx] = ""  # show value only once
                 i = j
+
+        def _date_runs(data_matrix, date_col_idx, first_data_row):
+            """Return [(row_start, row_end), ...] for contiguous identical Date values."""
+            runs = []
+            if len(data_matrix) <= first_data_row:
+                return runs
+            r = first_data_row
+            cur = data_matrix[r][date_col_idx]
+            start = r
+            for rr in range(r + 1, len(data_matrix)):
+                v = data_matrix[rr][date_col_idx]
+                if v != cur:
+                    runs.append((start, rr - 1))
+                    cur = v
+                    start = rr
+            runs.append((start, len(data_matrix) - 1))
+            return runs
 
         total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
         col_widths = [
@@ -394,6 +405,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 
         tbl = Table(data, colWidths=col_widths, repeatRows=1)
         style = [
+            # header
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
             ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
@@ -402,6 +414,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
             ("TOPPADDING", (0, 0), (-1, 0), 8),
 
+            # body defaults
             ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
             ("FONTSIZE", (0, 1), (-1, -1), 10),
             ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
@@ -411,15 +424,20 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
             ("ALIGN", (2, 1), (3, -1), "RIGHT"),
             ("ALIGN", (5, 1), (5, -1), "RIGHT"),
-            # ensure text in merged Day/Date cells is vertically centered
-            ("VALIGN", (0, 1), (1, -1), "MIDDLE"),
+            ("VALIGN", (0, 1), (1, -1), "MIDDLE"),  # merged Day/Date cells centered vertically
         ]
-        style.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [None, colors.HexColor("#f7f8fb")]))
+        # NOTE: intentionally NO ("ROWBACKGROUNDS", ...) here
 
         # ---- apply vertical merges for Day (col 0) and Date (col 1) ----
-        FIRST_DATA_ROW = 1  # row 0 is header
+        FIRST_DATA_ROW = 1  # header is row 0
         _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
         _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
+
+        # ---- apply group-level zebra by Date runs (uniform fill per merged block) ----
+        alt_colors = [colors.white, colors.HexColor("#f7f8fb")]
+        runs = _date_runs(data, date_col_idx=1, first_data_row=FIRST_DATA_ROW)
+        for idx, (r_start, r_end) in enumerate(runs):
+            style.append(("BACKGROUND", (0, r_start), (-1, r_end), alt_colors[idx % 2]))
 
         tbl.setStyle(TableStyle(style))
         elems.append(tbl)
@@ -429,6 +447,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             pdf_bytes = f.read()
     os.remove(tmp.name)
     return pdf_bytes
+
 
 
 # =========================
