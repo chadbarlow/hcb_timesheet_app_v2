@@ -161,9 +161,9 @@ def build_segs(df):
         # last event of the day
         l = recs[-1]
         segs.append({
-                "s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
-                "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"],
-                "force_other": False
+            "s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
+            "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"],
+            "force_other": False
         })
 
     return segs
@@ -348,7 +348,6 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 
         # Prepare fields for PDF display (short formats)
         if not display_df.empty:
-            # keep original Date (datetime.date) around for deriving day abbrev and short date
             display_df["_DayShort"] = display_df["Date"].apply(lambda d: d.strftime("%a") if pd.notna(d) else "")
             display_df["_DateShort"] = display_df["Date"].apply(lambda d: d.strftime("%m-%d") if pd.notna(d) else "")
             display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
@@ -374,7 +373,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 
         # Wrap Work Performed cells
         for row in mapped:
-            row[5] = Paragraph(row[5], wp_style)
+            row[5] = Paragraph(str(row[5]), wp_style)
 
         data = [headers] + mapped
 
@@ -438,14 +437,217 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
             ("ALIGN", (2, 1), (3, -1), "RIGHT"),   # Start, End
-            ("ALIGN", (6, 1), (6, -1), "RIGHT"),   # Hours (now col index 6)
+            ("ALIGN", (6, 1), (6, -1), "RIGHT"),   # Hours
             ("VALIGN", (0, 1), (1, -1), "MIDDLE"), # merged Day/Date cells
-            ("VALIGN", (5, 1), (5, -1), "TOP"),    # Work Performed: top-align multi-line notes
+            ("VALIGN", (5, 1), (5, -1), "TOP"),    # Work Performed
         ]
         # No ROWBACKGROUNDS — no striping
 
         # Apply vertical merges
         FIRST_DATA_ROW = 1  # header row is 0
+        _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
+        _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
+
+        tbl.setStyle(TableStyle(style))
+        elems.append(tbl)
+
+        doc.build(elems)
+        with open(tmp.name, "rb") as f:
+            pdf_bytes = f.read()
+    os.remove(tmp.name)
+    return pdf_bytes
+
+# =========================
+# NEW: Simple formatter for a "revised" CSV (already curated rows)
+# =========================
+def _normalize_revised_csv(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize common header variants and coerce values to the printable schema:
+    Day | Date | Start | End | Client | Work Performed | Hours
+    - Accepts case-insensitive headers like "Day of week", "Client Name", "Client Hours", etc.
+    - Times are displayed as HH:MM strings.
+    - Hours is numeric; whole numbers shown as ints later.
+    """
+    # Map common variants -> canonical
+    variants = {
+        "day of week": "Day", "day": "Day", "dow": "Day",
+        "date": "Date",
+        "start time": "Start", "start": "Start",
+        "end time": "End", "end": "End",
+        "client name": "Client", "client": "Client",
+        "client hours": "Hours", "hours": "Hours", "hrs": "Hours",
+        "work performed": "Work Performed", "notes": "Work Performed", "work": "Work Performed",
+    }
+    rename = {}
+    for c in df_raw.columns:
+        key = c.strip().lower()
+        if key in variants:
+            rename[c] = variants[key]
+    df = df_raw.rename(columns=rename).copy()
+
+    # Ensure all required columns exist
+    for col in ["Day", "Date", "Start", "End", "Client", "Work Performed", "Hours"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Coerce Start/End to HH:MM strings
+    def _fmt_time_cell(v):
+        if pd.isna(v) or v == "":
+            return ""
+        if isinstance(v, datetime.time):
+            return f"{v.hour:02d}:{v.minute:02d}"
+        try:
+            ts = pd.to_datetime(v, errors="coerce")
+            if pd.isna(ts):
+                # leave as-is (string like "09:30")
+                s = str(v)
+                # quick patch: 9:0 -> 09:00, 9 -> 09:00
+                if ":" in s:
+                    hh, mm = s.split(":", 1)
+                    try:
+                        return f"{int(hh):02d}:{int(mm):02d}"
+                    except Exception:
+                        return s
+                else:
+                    try:
+                        return f"{int(s):02d}:00"
+                    except Exception:
+                        return s
+            return f"{ts.hour:02d}:{ts.minute:02d}"
+        except Exception:
+            return str(v)
+
+    df["Start"] = df["Start"].apply(_fmt_time_cell)
+    df["End"] = df["End"].apply(_fmt_time_cell)
+
+    # Hours numeric where possible
+    def _coerce_hours(x):
+        if pd.isna(x) or x == "":
+            return ""
+        try:
+            val = float(x)
+            return int(val) if val == int(val) else round(val, 2)
+        except Exception:
+            return x
+    df["Hours"] = df["Hours"].apply(_coerce_hours)
+
+    # Work Performed to string, fillna
+    df["Work Performed"] = df["Work Performed"].fillna("").astype(str)
+
+    # Keep only canonical columns in desired order
+    df_out = df[["Day", "Date", "Start", "End", "Client", "Work Performed", "Hours"]].copy()
+    # Sort by Date-Start if those are sortable; otherwise keep original order
+    try:
+        sort_key_date = pd.to_datetime(df_out["Date"], errors="coerce")
+        sort_key_start = pd.to_datetime(df_out["Start"], format="%H:%M", errors="coerce")
+        df_out = df_out.assign(_d=sort_key_date, _s=sort_key_start).sort_values(["_d", "_s"], na_position="last")
+        df_out = df_out.drop(columns=["_d", "_s"])
+    except Exception:
+        pass
+
+    return df_out.reset_index(drop=True)
+
+def export_pdf_from_revised(df_revised: pd.DataFrame, employee_name: str = "Chad Barlow", title: str = "HCB TIMESHEET"):
+    """
+    Build the same PDF table as export_pdf_detailed, but treat Day/Date as already-prepared strings.
+    No "Week of" line (we may not have a reference Monday).
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        doc = SimpleDocTemplate(
+            tmp.name,
+            pagesize=landscape(letter),
+            leftMargin=0.5 * inch,
+            rightMargin=0.5 * inch,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+        )
+
+        # Styles
+        h_style = ParagraphStyle("H", fontName=PDF_FONT_BOLD, fontSize=18, alignment=TA_CENTER, spaceAfter=20, textColor=colors.HexColor("#31333f"))
+        l_style = ParagraphStyle("L", fontName=PDF_FONT, fontSize=10, spaceAfter=6, textColor=colors.HexColor("#31333f"))
+        wp_style = ParagraphStyle("WP", fontName=PDF_FONT, fontSize=9, leading=11, textColor=colors.HexColor("#31333f"))
+
+        elems = [
+            Paragraph(title, h_style),
+            Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
+            Spacer(1, 0.15 * inch),
+        ]
+
+        # Prepare data
+        headers = ["Day", "Date", "Start", "End", "Client", "Work Performed", "Hours"]
+        data_rows = df_revised.copy()
+        # Ensure columns present
+        for c in headers:
+            if c not in data_rows.columns:
+                data_rows[c] = ""
+        # Wrap Work Performed
+        mapped = data_rows[headers].values.tolist()
+        for row in mapped:
+            row[5] = Paragraph(str(row[5]), wp_style)
+        data = [headers] + mapped
+
+        # helper for vertical spans on equal contiguous strings
+        def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
+            if len(data_matrix) <= first_data_row:
+                return
+            r0 = first_data_row
+            vals = [row[col_idx] for row in data_matrix[first_data_row:]]
+            i = 0
+            while i < len(vals):
+                j = i + 1
+                while j < len(vals) and vals[j] == vals[i]:
+                    j += 1
+                if (j - i) > 1 and str(vals[i]) != "":
+                    style_list.append(("SPAN", (col_idx, r0 + i), (col_idx, r0 + j - 1)))
+                    for k in range(i + 1, j):
+                        data_matrix[first_data_row + k][col_idx] = ""
+                i = j
+
+        # Column widths (Work Performed = 50%)
+        total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
+        work_w = total_width * 0.5
+        other_w = total_width - work_w  # 50%
+
+        base_day   = 1.1 * inch
+        base_date  = 1.3 * inch
+        base_start = 1.0 * inch
+        base_end   = 1.0 * inch
+        base_hours = 0.9 * inch
+        base_client = total_width - (base_day + base_date + base_start + base_end + base_hours)
+
+        scale = other_w / (base_day + base_date + base_start + base_end + base_client + base_hours)
+        day_w    = base_day * scale
+        date_w   = base_date * scale
+        start_w  = base_start * scale
+        end_w    = base_end * scale
+        client_w = base_client * scale
+        hours_w  = base_hours * scale
+
+        col_widths = [day_w, date_w, start_w, end_w, client_w, work_w, hours_w]
+
+        tbl = Table(data, colWidths=col_widths, repeatRows=1)
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
+            ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
+            ("ALIGN", (0, 0), (-1, 0), "LEFT"),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ("TOPPADDING", (0, 0), (-1, 0), 8),
+
+            ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
+            ("FONTSIZE", (0, 1), (-1, -1), 10),
+            ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
+            ("TOPPADDING", (0, 1), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
+
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
+            ("ALIGN", (2, 1), (3, -1), "RIGHT"),
+            ("ALIGN", (6, 1), (6, -1), "RIGHT"),
+            ("VALIGN", (0, 1), (1, -1), "MIDDLE"),
+            ("VALIGN", (5, 1), (5, -1), "TOP"),
+        ]
+        FIRST_DATA_ROW = 1
         _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
         _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
 
@@ -613,3 +815,60 @@ if files:
             """,
             unsafe_allow_html=True,
         )
+
+# =========================
+# NEW SECTION: Format Revised CSV (no allocation — just pretty PDF)
+# =========================
+st.markdown("---")
+st.header("Format Revised CSV (no processing, just formatting)")
+
+revised_file = st.file_uploader(
+    "Upload a revised CSV to format (columns like Day, Date, Start, End, Client, Work Performed, Hours)",
+    type=["csv"],
+    accept_multiple_files=False,
+    key="revised_csv",
+)
+
+if revised_file is not None:
+    try:
+        df_rev_raw = pd.read_csv(revised_file)
+    except Exception:
+        # fallback for odd encodings
+        revised_file.seek(0)
+        df_rev_raw = pd.read_csv(revised_file, encoding="latin-1")
+
+    df_rev = _normalize_revised_csv(df_rev_raw)
+
+    st.subheader("Preview (normalized)")
+    st.dataframe(df_rev, use_container_width=True)
+
+    # Offer downloads
+    norm_csv_bytes = df_rev.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download Normalized CSV",
+        data=norm_csv_bytes,
+        file_name="Revised_Normalized.csv",
+        mime="text/csv",
+        key="rev_norm_csv",
+    )
+
+    # Build matching PDF (no week line)
+    pdf_bytes_rev = export_pdf_from_revised(df_rev, employee_name=employee_name, title="HCB TIMESHEET — Revised CSV")
+    st.download_button(
+        label="Download PDF (Revised CSV)",
+        data=pdf_bytes_rev,
+        file_name="HCB_Timesheet_Revised.pdf",
+        mime="application/pdf",
+        key="rev_pdf",
+    )
+
+    # Inline preview
+    b64_rev = base64.b64encode(pdf_bytes_rev).decode()
+    st.markdown(
+        f"""
+        <object data="data:application/pdf;base64,{b64_rev}" type="application/pdf" width="100%" height="800px">
+            <embed src="data:application/pdf;base64,{b64_rev}" type="application/pdf"/>
+        </object>
+        """,
+        unsafe_allow_html=True,
+    )
