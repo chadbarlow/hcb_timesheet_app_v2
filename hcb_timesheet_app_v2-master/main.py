@@ -290,139 +290,139 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Styled PDF (Detailed Rows)
 # =========================
-def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        doc = SimpleDocTemplate(
-            tmp.name,
-            pagesize=landscape(letter),
-            leftMargin=0.5 * inch,
-            rightMargin=0.5 * inch,
-            topMargin=0.5 * inch,
-            bottomMargin=0.5 * inch,
-        )
-
-        # Styles
-        h_style = ParagraphStyle(
-            "H",
-            fontName=PDF_FONT_BOLD,
-            fontSize=18,
-            alignment=TA_CENTER,
-            spaceAfter=28,
-            textColor=colors.HexColor("#31333f"),
-        )
-        l_style = ParagraphStyle(
-            "L",
-            fontName=PDF_FONT,
-            fontSize=10,
-            spaceAfter=10,
-            textColor=colors.HexColor("#31333f"),
-        )
-
-        total_hrs = float(df_week["Client Hours"].fillna(0).sum())
-        th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
-
-        elems = [
-            Paragraph("HCB TIMESHEET", h_style),
-            Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
-            Paragraph(f"Week of: <b>{week_monday:%B %-d, %Y}</b>", l_style),
-            Paragraph(
-                f'Total Hours: <b><font backcolor="#fffac1" color="#373737">{th}</font></b>',
-                l_style,
-            ),
-            Spacer(1, 0.18 * inch),
-        ]
-
-        display_df = df_week.copy()
-
-        def fmt_time(t):
-            if pd.isna(t):
-                return ""
-            return f"{int(t.hour):02d}:{int(t.minute):02d}"
-
-        if not display_df.empty:
-            display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
-            display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
-            display_df["End Time"] = display_df["End Time"].apply(fmt_time)
-            display_df["Client Hours"] = display_df["Client Hours"].apply(
-                lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
+    def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            doc = SimpleDocTemplate(
+                tmp.name,
+                pagesize=landscape(letter),
+                leftMargin=0.5 * inch,
+                rightMargin=0.5 * inch,
+                topMargin=0.5 * inch,
+                bottomMargin=0.5 * inch,
             )
-
-        headers = ["Day", "Date", "Start", "End", "Client", "Hours"]
-        data = [headers] + display_df.rename(
-            columns={
-                "Day of week": "Day",
-                "Client Name": "Client",
-                "Client Hours": "Hours",
-                "Start Time": "Start",
-                "End Time": "End",
-            }
-        )[headers].values.tolist()
-
-        # helper: add vertical spans for contiguous equal values; blank duplicates
-        def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
-            if len(data_matrix) <= first_data_row:
-                return
-            r0 = first_data_row
-            vals = [row[col_idx] for row in data_matrix[first_data_row:]]
-            i = 0
-            while i < len(vals):
-                j = i + 1
-                while j < len(vals) and vals[j] == vals[i]:
-                    j += 1
-                if (j - i) > 1 and str(vals[i]) != "":
-                    style_list.append(("SPAN", (col_idx, r0 + i), (col_idx, r0 + j - 1)))
-                    for k in range(i + 1, j):
-                        data_matrix[first_data_row + k][col_idx] = ""
-                i = j
-
-        total_width = landscape(letter)[0] - doc.leftMargin - doc.RightMargin if hasattr(doc, "RightMargin") else landscape(letter)[0] - doc.leftMargin - doc.rightMargin
-        col_widths = [
-            1.1 * inch,  # Day
-            1.3 * inch,  # Date
-            1.0 * inch,  # Start
-            1.0 * inch,  # End
-            total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
-            0.9 * inch,  # Hours
-        ]
-
-        tbl = Table(data, colWidths=col_widths, repeatRows=1)
-        style = [
-            # header
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
-            ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
-            ("FONTSIZE", (0, 0), (-1, 0), 10),
-            ("ALIGN", (0, 0), (-1, 0), "LEFT"),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-            ("TOPPADDING", (0, 0), (-1, 0), 8),
-
-            # body defaults
-            ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
-            ("FONTSIZE", (0, 1), (-1, -1), 10),
-            ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
-            ("TOPPADDING", (0, 1), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
-
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
-            ("ALIGN", (2, 1), (3, -1), "RIGHT"),
-            ("ALIGN", (5, 1), (5, -1), "RIGHT"),
-            ("VALIGN", (0, 1), (1, -1), "MIDDLE"),  # center Day/Date merged cells vertically
-        ]
-        # NOTE: No ROWBACKGROUNDS and no per-block backgrounds
-
-        # apply vertical merges for Day (col 0) and Date (col 1)
-        FIRST_DATA_ROW = 1  # header row is 0
-        _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
-        _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
-
-        tbl.setStyle(TableStyle(style))
-        elems.append(tbl)
-
-        doc.build(elems)
-        with open(tmp.name, "rb") as f:
-            pdf_bytes = f.read()
-    os.remove(tmp.name)
-    return pdf_bytes
+    
+            # Styles
+            h_style = ParagraphStyle(
+                "H",
+                fontName=PDF_FONT_BOLD,
+                fontSize=18,
+                alignment=TA_CENTER,
+                spaceAfter=28,
+                textColor=colors.HexColor("#31333f"),
+            )
+            l_style = ParagraphStyle(
+                "L",
+                fontName=PDF_FONT,
+                fontSize=10,
+                spaceAfter=10,
+                textColor=colors.HexColor("#31333f"),
+            )
+    
+            total_hrs = float(df_week["Client Hours"].fillna(0).sum())
+            th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
+    
+            elems = [
+                Paragraph("HCB TIMESHEET", h_style),
+                Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
+                Paragraph(f"Week of: <b>{week_monday:%B %-d, %Y}</b>", l_style),
+                Paragraph(
+                    f'Total Hours: <b><font backcolor="#fffac1" color="#373737">{th}</font></b>',
+                    l_style,
+                ),
+                Spacer(1, 0.18 * inch),
+            ]
+    
+            display_df = df_week.copy()
+    
+            def fmt_time(t):
+                if pd.isna(t):
+                    return ""
+                return f"{int(t.hour):02d}:{int(t.minute):02d}"
+    
+            if not display_df.empty:
+                display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
+                display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
+                display_df["End Time"] = display_df["End Time"].apply(fmt_time)
+                display_df["Client Hours"] = display_df["Client Hours"].apply(
+                    lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
+                )
+    
+            headers = ["Day", "Date", "Start", "End", "Client", "Hours"]
+            data = [headers] + display_df.rename(
+                columns={
+                    "Day of week": "Day",
+                    "Client Name": "Client",
+                    "Client Hours": "Hours",
+                    "Start Time": "Start",
+                    "End Time": "End",
+                }
+            )[headers].values.tolist()
+    
+            # helper: add vertical spans for contiguous equal values; blank duplicates
+            def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
+                if len(data_matrix) <= first_data_row:
+                    return
+                r0 = first_data_row
+                vals = [row[col_idx] for row in data_matrix[first_data_row:]]
+                i = 0
+                while i < len(vals):
+                    j = i + 1
+                    while j < len(vals) and vals[j] == vals[i]:
+                        j += 1
+                    if (j - i) > 1 and str(vals[i]) != "":
+                        style_list.append(("SPAN", (col_idx, r0 + i), (col_idx, r0 + j - 1)))
+                        for k in range(i + 1, j):
+                            data_matrix[first_data_row + k][col_idx] = ""
+                    i = j
+    
+            total_width = landscape(letter)[0] - doc.leftMargin - doc.RightMargin if hasattr(doc, "RightMargin") else landscape(letter)[0] - doc.leftMargin - doc.rightMargin
+            col_widths = [
+                1.1 * inch,  # Day
+                1.3 * inch,  # Date
+                1.0 * inch,  # Start
+                1.0 * inch,  # End
+                total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
+                0.9 * inch,  # Hours
+            ]
+    
+            tbl = Table(data, colWidths=col_widths, repeatRows=1)
+            style = [
+                # header
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
+                ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
+                ("FONTSIZE", (0, 0), (-1, 0), 10),
+                ("ALIGN", (0, 0), (-1, 0), "LEFT"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                ("TOPPADDING", (0, 0), (-1, 0), 8),
+    
+                # body defaults
+                ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
+                ("FONTSIZE", (0, 1), (-1, -1), 10),
+                ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
+                ("TOPPADDING", (0, 1), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
+    
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
+                ("ALIGN", (2, 1), (3, -1), "RIGHT"),
+                ("ALIGN", (5, 1), (5, -1), "RIGHT"),
+                ("VALIGN", (0, 1), (1, -1), "MIDDLE"),  # center Day/Date merged cells vertically
+            ]
+            # NOTE: No ROWBACKGROUNDS and no per-block backgrounds
+    
+            # apply vertical merges for Day (col 0) and Date (col 1)
+            FIRST_DATA_ROW = 1  # header row is 0
+            _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
+            _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
+    
+            tbl.setStyle(TableStyle(style))
+            elems.append(tbl)
+    
+            doc.build(elems)
+            with open(tmp.name, "rb") as f:
+                pdf_bytes = f.read()
+        os.remove(tmp.name)
+        return pdf_bytes
 
 
         # ---- helpers ----
