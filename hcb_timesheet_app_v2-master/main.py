@@ -502,6 +502,60 @@ if files:
         # Display
         st.dataframe(render_df, use_container_width=True)
 
+                # --- NEW: Daily-by-client summary table with day totals ---
+        # Filter out placeholder rows (no client or hours)
+        tidy = render_df.dropna(subset=["Client Name", "Client Hours"]).copy()
+
+        # Build pivot: rows = Date, columns = Client Name, values = sum of hours
+        pivot = (
+            tidy.pivot_table(
+                index="Date",
+                columns="Client Name",
+                values="Client Hours",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+            .sort_index()
+        )
+
+        # Reindex to ensure all Mon–Fri dates appear (even if zero)
+        pivot = pivot.reindex(pd.Index(days, name="Date"), fill_value=0.0)
+
+        # Optional: move 'Other' to the last column if present
+        cols = list(pivot.columns)
+        if any(c for c in cols if isinstance(c, str) and c.strip().lower() == "other"):
+            other = [c for c in cols if isinstance(c, str) and c.strip().lower() == "other"]
+            non_other = [c for c in cols if c not in other]
+            pivot = pivot[non_other + other]
+
+        # Add a per-day total column
+        pivot["Total"] = pivot.sum(axis=1)
+
+        st.markdown("#### Daily hours by client (with day totals)")
+        st.dataframe(pivot, use_container_width=True)
+
+        # Download the summary as CSV
+        summary_csv = pivot.reset_index().to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"Download Daily Summary CSV (Week of {wk:%Y-%m-%d})",
+            data=summary_csv,
+            file_name=f"Daily_Summary_{wk:%Y-%m-%d}.csv",
+            mime="text/csv",
+            key=f"csv_summary_{wk}",
+        )
+
+                # Optional: tidy “tall” summary table (Date | Client | Hours)
+        tall = (
+            pivot.drop(columns=["Total"])
+                 .stack()
+                 .rename("Hours")
+                 .reset_index()
+                 .sort_values(["Date", "Client Name"])
+                 .reset_index(drop=True)
+        )
+        st.markdown("#### (Optional) Daily hours by client — tidy view")
+        st.dataframe(tall, use_container_width=True)
+
         # Downloads: CSV + PDF + inline preview
         csv_bytes = render_df.to_csv(index=False).encode("utf-8")
         st.download_button(
