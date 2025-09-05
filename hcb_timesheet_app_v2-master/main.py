@@ -358,6 +358,30 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             }
         )[headers].values.tolist()
 
+        # --- helper to add vertical spans on contiguous equal values in a column ---
+        def _add_vertical_spans(data_matrix, col_idx, first_data_row, style_list):
+            """
+            Adds ('SPAN', ...) entries for contiguous identical values in column col_idx,
+            starting at table row 'first_data_row'. Also blanks the duplicate cells so only
+            the top cell in the span shows text.
+            """
+            if len(data_matrix) <= first_data_row:
+                return
+            r = first_data_row
+            vals = [row[col_idx] for row in data_matrix[first_data_row:]]
+            i = 0
+            while i < len(vals):
+                j = i + 1
+                while j < len(vals) and vals[j] == vals[i]:
+                    j += 1
+                # span only if there are >=2 contiguous identical values and not empty string
+                if (j - i) > 1 and str(vals[i]) != "":
+                    style_list.append(("SPAN", (col_idx, r + i), (col_idx, r + j - 1)))
+                    # blank duplicates inside the span (keep the first)
+                    for k in range(i + 1, j):
+                        data_matrix[first_data_row + k][col_idx] = ""
+                i = j
+
         total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
         col_widths = [
             1.1 * inch,  # Day
@@ -387,8 +411,15 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
             ("ALIGN", (2, 1), (3, -1), "RIGHT"),
             ("ALIGN", (5, 1), (5, -1), "RIGHT"),
+            # ensure text in merged Day/Date cells is vertically centered
+            ("VALIGN", (0, 1), (1, -1), "MIDDLE"),
         ]
         style.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [None, colors.HexColor("#f7f8fb")]))
+
+        # ---- apply vertical merges for Day (col 0) and Date (col 1) ----
+        FIRST_DATA_ROW = 1  # row 0 is header
+        _add_vertical_spans(data, col_idx=0, first_data_row=FIRST_DATA_ROW, style_list=style)  # Day
+        _add_vertical_spans(data, col_idx=1, first_data_row=FIRST_DATA_ROW, style_list=style)  # Date
 
         tbl.setStyle(TableStyle(style))
         elems.append(tbl)
@@ -398,6 +429,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             pdf_bytes = f.read()
     os.remove(tmp.name)
     return pdf_bytes
+
 
 # =========================
 # UI
