@@ -161,9 +161,9 @@ def build_segs(df):
         # last event of the day
         l = recs[-1]
         segs.append({
-            "s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
-            "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"],
-            "force_other": False
+                "s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
+                "ot": l["ot"], "dt": l["dt"], "on": l["origin"], "dn": l["destin"],
+                "force_other": False
         })
 
     return segs
@@ -283,7 +283,8 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================
-# Styled PDF (Detailed Rows) — with Day/Date merges, no zebra, Work Performed column
+# Styled PDF (Detailed Rows) — with Day/Date merges, no zebra,
+# Work Performed column (50% width), and short formats: Mon / 09-01
 # =========================
 def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -345,8 +346,11 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
                 return ""
             return f"{int(t.hour):02d}:{int(t.minute):02d}"
 
+        # Prepare fields for PDF display (short formats)
         if not display_df.empty:
-            display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
+            # keep original Date (datetime.date) around for deriving day abbrev and short date
+            display_df["_DayShort"] = display_df["Date"].apply(lambda d: d.strftime("%a") if pd.notna(d) else "")
+            display_df["_DateShort"] = display_df["Date"].apply(lambda d: d.strftime("%m-%d") if pd.notna(d) else "")
             display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
             display_df["End Time"] = display_df["End Time"].apply(fmt_time)
             display_df["Client Hours"] = display_df["Client Hours"].apply(
@@ -354,17 +358,19 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             )
             display_df["Work Performed"] = display_df["Work Performed"].fillna("").astype(str)
 
-        # Build data with new column order (Work Performed between Client and Hours)
+        # Build data with desired column order and short formats
         headers = ["Day", "Date", "Start", "End", "Client", "Work Performed", "Hours"]
-        mapped = display_df.rename(
-            columns={
-                "Day of week": "Day",
-                "Client Name": "Client",
-                "Client Hours": "Hours",
-                "Start Time": "Start",
-                "End Time": "End",
-            }
-        )[headers].values.tolist()
+        df_for_pdf = pd.DataFrame({
+            "Day": display_df["_DayShort"] if "_DayShort" in display_df else "",
+            "Date": display_df["_DateShort"] if "_DateShort" in display_df else "",
+            "Start": display_df["Start Time"],
+            "End": display_df["End Time"],
+            "Client": display_df["Client Name"],
+            "Work Performed": display_df["Work Performed"],
+            "Hours": display_df["Client Hours"],
+        })
+
+        mapped = df_for_pdf[headers].values.tolist()
 
         # Wrap Work Performed cells
         for row in mapped:
@@ -389,12 +395,12 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
                         data_matrix[first_data_row + k][col_idx] = ""
                 i = j
 
-        # ----- column widths: 50% to Work Performed; other columns share the remaining 50% proportionally -----
+        # ----- column widths: 50% to Work Performed; others share the remaining 50% proportionally -----
         total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
         work_w = total_width * 0.5
         other_w = total_width - work_w  # 50%
 
-        # Base proportions from prior layout
+        # Base proportions from prior layout (sum to total_width)
         base_day   = 1.1 * inch
         base_date  = 1.3 * inch
         base_start = 1.0 * inch
@@ -402,7 +408,7 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
         base_hours = 0.9 * inch
         base_client = total_width - (base_day + base_date + base_start + base_end + base_hours)
 
-        scale = other_w / (base_day + base_date + base_start + base_end + base_client + base_hours)  # = other_w / total_width
+        scale = other_w / (base_day + base_date + base_start + base_end + base_client + base_hours)
         day_w    = base_day * scale
         date_w   = base_date * scale
         start_w  = base_start * scale
