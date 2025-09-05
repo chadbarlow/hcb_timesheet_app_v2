@@ -19,7 +19,7 @@ from reportlab.lib.pagesizes import letter, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+from reportlab.lib.enums import TA_CENTER
 
 # =========================
 # Font setup (graceful fallback)
@@ -48,6 +48,9 @@ except Exception:
 r_q_h = lambda h: math.ceil(float(h) * 4) / 4 if pd.notnull(h) and h != "" else 0.0
 get_mon = lambda d: d - datetime.timedelta(days=d.weekday())
 find_weeks = lambda dates: sorted(list(set(get_mon(d) for d in dates)))
+
+def _norm_client(x: str) -> str:
+    return (x or "").strip().casefold()
 
 # =========================
 # Data processing
@@ -144,7 +147,7 @@ def alloc_detailed(segs):
     Returns a flat table with columns:
     Day of week | Date | Start Time | End Time | Client Name | Client Hours
     - Client Hours are rounded UP to the nearest 0.25h
-    - Start/End times remain as actual clamped event/gap boundaries
+    - Start/End times remain as clamped event/gap boundaries
     """
     cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]
     if not segs:
@@ -190,13 +193,68 @@ def alloc_detailed(segs):
     return df
 
 # =========================
+# NEW: Consolidate contiguous same-client rows
+# =========================
+def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge adjacent rows when:
+      - Same Date
+      - Same Client Name (case/space-insensitive)
+      - Previous End Time == Next Start Time
+    Recompute duration from Start/End for the merged block, then apply quarter-hour ceil once.
+    """
+    if df.empty:
+        return df
+
+    # Keep only rows with real intervals and client names for consolidation pass
+    work = df.dropna(subset=["Start Time", "End Time", "Client Name"]).copy()
+    if work.empty:
+        return df
+
+    work["_client_norm"] = work["Client Name"].apply(_norm_client)
+    work = work.sort_values(["Date", "_client_norm", "Start Time"]).reset_index(drop=True)
+
+    blocks = []
+    for _, row in work.iterrows():
+        if not blocks:
+            blocks.append(row.to_dict())
+            continue
+
+        prev = blocks[-1]
+        same_day = row["Date"] == prev["Date"]
+        same_client = row["_client_norm"] == prev["_client_norm"]
+        contiguous = row["Start Time"] == prev["End Time"]
+
+        if same_day and same_client and contiguous:
+            # extend the previous block's End Time
+            prev["End Time"] = row["End Time"]
+            # duration will be recomputed after scanning
+        else:
+            blocks.append(row.to_dict())
+
+    # Build consolidated DataFrame
+    cons = pd.DataFrame(blocks)
+    # Recompute hours exactly from Start/End (no compounding), then ceil to 0.25
+    def _raw_hours(r):
+        start_dt = datetime.datetime.combine(r["Date"], r["Start Time"])
+        end_dt = datetime.datetime.combine(r["Date"], r["End Time"])
+        return (end_dt - start_dt).total_seconds() / 3600.0
+
+    cons["Client Hours"] = cons.apply(_raw_hours, axis=1).apply(r_q_h)
+    cons["Day of week"] = cons["Date"].apply(lambda d: d.strftime("%A"))
+    cons = cons.drop(columns=["_client_norm"], errors="ignore")
+    cons = cons[["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]]
+
+    # Now, bring back any original rows that couldn't be consolidated (e.g., placeholders)
+    non_merge = df[df["Start Time"].isna() | df["End Time"].isna() | df["Client Name"].isna()]
+    out = pd.concat([cons, non_merge], ignore_index=True)
+    out = out.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
+    return out
+
+# =========================
 # Styled PDF (Detailed Rows)
 # =========================
 def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
-    """
-    Build a landscape PDF with a detailed, per-row schedule:
-    Day | Date | Start | End | Client | Hours
-    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         doc = SimpleDocTemplate(
             tmp.name,
@@ -224,11 +282,9 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             textColor=colors.HexColor("#31333f"),
         )
 
-        # Compute total hours (ignoring NaNs)
         total_hrs = float(df_week["Client Hours"].fillna(0).sum())
         th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
 
-        # Header
         elems = [
             Paragraph("HCB TIMESHEET", h_style),
             Paragraph(f"Employee: <b>{employee_name}</b>", l_style),
@@ -240,10 +296,8 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             Spacer(1, 0.18 * inch),
         ]
 
-        # Table data
-        # Ensure columns and friendly formatting
         display_df = df_week.copy()
-        # format date and time for table
+
         def fmt_time(t):
             if pd.isna(t):
                 return ""
@@ -253,7 +307,6 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
             display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
             display_df["End Time"] = display_df["End Time"].apply(fmt_time)
-            # Pretty print hours (strip .0)
             display_df["Client Hours"] = display_df["Client Hours"].apply(
                 lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
             )
@@ -269,20 +322,18 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             }
         )[headers].values.tolist()
 
-        # Column widths
         total_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
         col_widths = [
             1.1 * inch,  # Day
             1.3 * inch,  # Date
             1.0 * inch,  # Start
             1.0 * inch,  # End
-            total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client (flex)
+            total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
             0.9 * inch,  # Hours
         ]
 
         tbl = Table(data, colWidths=col_widths, repeatRows=1)
-
-        base_style = [
+        style = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
             ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
@@ -298,17 +349,12 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
 
             ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
-
-            ("ALIGN", (0, 1), (0, -1), "LEFT"),   # Day
-            ("ALIGN", (1, 1), (1, -1), "LEFT"),   # Date
-            ("ALIGN", (2, 1), (3, -1), "RIGHT"),  # Start/End
-            ("ALIGN", (4, 1), (4, -1), "LEFT"),   # Client
-            ("ALIGN", (5, 1), (5, -1), "RIGHT"),  # Hours
+            ("ALIGN", (2, 1), (3, -1), "RIGHT"),
+            ("ALIGN", (5, 1), (5, -1), "RIGHT"),
         ]
-        # Zebra rows
-        base_style.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [None, colors.HexColor("#f7f8fb")]))
+        style.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [None, colors.HexColor("#f7f8fb")]))
 
-        tbl.setStyle(TableStyle(base_style))
+        tbl.setStyle(TableStyle(style))
         elems.append(tbl)
 
         doc.build(elems)
@@ -321,9 +367,8 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 # UI
 # =========================
 st.set_page_config(layout="wide")
-st.title("MileIQ Billables ➜ Detailed Weekly Schedule (with Styled PDF)")
+st.title("MileIQ Billables ➜ Detailed Weekly Schedule (Merged Blocks + Styled PDF)")
 
-# Optional header config
 employee_name = st.text_input("Employee name (for PDF header)", value="Chad Barlow")
 
 files = st.file_uploader(
@@ -364,18 +409,25 @@ if files:
         st.info("Select at least one week to proceed.")
         st.stop()
 
-    enable_edit = st.checkbox("Enable inline edits (Client / Hours)", value=False, help="Start/End times derive from travel/visit segments and are not editable here.")
+    enable_edit = st.checkbox(
+        "Enable inline edits (Client / Hours)",
+        value=False,
+        help="Start/End times derive from segments and are not editable here.",
+    )
 
     for wk in sorted(sel_weeks):
         st.markdown(f"### Week of {wk:%B %d, %Y}")
 
-        # Mon–Fri window (to match your sample output)
+        # Mon–Fri window
         days = [wk + datetime.timedelta(days=i) for i in range(5)]  # Monday..Friday
         mask = detailed_all["Date"].between(days[0], days[-1])
         df_week = detailed_all.loc[mask].copy()
 
-        # Ensure one placeholder row per weekday if empty
-        present = set(df_week["Date"].unique())
+        # ---- NEW: consolidate contiguous same-client blocks before placeholders ----
+        df_week = consolidate_contiguous(df_week)
+
+        # Ensure at least one placeholder row per weekday (if empty)
+        present = set(df_week["Date"].dropna().unique())
         for d in days:
             if d not in present:
                 df_week = pd.concat(
@@ -400,9 +452,8 @@ if files:
         # Order for display
         df_week = df_week.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
 
-        # Show editor or read-only table
+        # Editor or read-only
         if enable_edit:
-            # Configure editor: allow editing Client Name & Hours; lock Day/Date/Times
             edited = st.data_editor(
                 df_week,
                 key=f"edit_{wk}",
@@ -428,7 +479,7 @@ if files:
             unsafe_allow_html=True,
         )
 
-        # Display table
+        # Display
         st.dataframe(render_df, use_container_width=True)
 
         # Downloads: CSV + PDF + inline preview
@@ -450,7 +501,7 @@ if files:
             key=f"pdf_{wk}",
         )
 
-        # Inline embed (desktop-friendly <object> + <embed> fallback)
+        # Inline embed
         b64 = base64.b64encode(pdf_bytes).decode()
         st.markdown(
             f"""
