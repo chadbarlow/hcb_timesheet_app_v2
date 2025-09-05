@@ -45,12 +45,36 @@ except Exception:
 # =========================
 # Helpers
 # =========================
-r_q_h = lambda h: math.ceil(float(h) * 4) / 4 if pd.notnull(h) and h != "" else 0.0
+
+def r_q_nearest(h):
+    """Round to nearest 0.25h (15 min). Half-quarters round up."""
+    if h is None or h == "" or (isinstance(h, float) and np.isnan(h)):
+        return 0.0
+    x = float(h) * 4.0
+    return math.floor(x + 0.5) / 4.0
+
 get_mon = lambda d: d - datetime.timedelta(days=d.weekday())
 find_weeks = lambda dates: sorted(list(set(get_mon(d) for d in dates)))
 
 def _norm_client(x: str) -> str:
     return (x or "").strip().casefold()
+
+def fmt_time_friendly(t: datetime.time | pd.Timestamp | None) -> str:
+    """Return '8 am', '3:30 pm' (no leading zero, lowercase am/pm). Empty for NaT/None."""
+    if t is None or (isinstance(t, float) and np.isnan(t)):
+        return ""
+    if isinstance(t, pd.Timestamp):
+        t = t.to_pydatetime().time()
+    if pd.isna(t):
+        return ""
+    hh, mm = t.hour, t.minute
+    suffix = "am" if hh < 12 else "pm"
+    hour12 = hh % 12
+    hour12 = 12 if hour12 == 0 else hour12
+    if mm == 0:
+        return f"{hour12} {suffix}"
+    else:
+        return f"{hour12}:{mm:02d} {suffix}"
 
 # =========================
 # Data processing
@@ -101,13 +125,11 @@ def clamp(df):
 def build_segs(df):
     """
     Build clamped event segments + same-day gaps between events.
-    NEW: For each day, if the first clamped segment starts AFTER 08:00,
-    insert a leading gap [08:00 -> first_cs] and mark it to force owner='Other'.
+    Includes pre-8:00 -> first drive gap per day, forced to 'Other'.
     """
     if df.empty:
         return []
 
-    # Ensure sorted and group by calendar day of the clamped start
     df = df.sort_values("cs").copy()
     df["_day"] = df["cs"].dt.date
 
@@ -117,7 +139,7 @@ def build_segs(df):
         if not recs:
             continue
 
-        # --- NEW: pre-8am → first drive gap (forced 'Other') ---
+        # Pre-8:00 -> first event start gap, force 'Other'
         eight = datetime.datetime.combine(day, datetime.time(8, 0))
         first_cs = recs[0]["cs"]
         if first_cs > eight:
@@ -126,18 +148,16 @@ def build_segs(df):
                 "e": first_cs,
                 "dur": (first_cs - eight).total_seconds() / 3600.0,
                 "ot": None, "dt": None, "on": None, "dn": None,
-                "force_other": True   # <— flag picked up by allocator
+                "force_other": True
             })
 
-        # --- Normal segments + in-day gaps ---
+        # Events and gaps
         for p, c in zip(recs, recs[1:]):
-            # event segment
             segs.append({
                 "s": p["cs"], "e": p["ce"], "dur": p["dur_hr"],
                 "ot": p["ot"], "dt": p["dt"], "on": p["origin"], "dn": p["destin"],
                 "force_other": False
             })
-            # gap between same-day events
             if p["ce"].date() == c["cs"].date() and c["cs"] > p["ce"]:
                 segs.append({
                     "s": p["ce"], "e": c["cs"],
@@ -146,7 +166,6 @@ def build_segs(df):
                     "force_other": False
                 })
 
-        # last event of the day
         l = recs[-1]
         segs.append({
             "s": l["cs"], "e": l["ce"], "dur": l["dur_hr"],
@@ -156,15 +175,15 @@ def build_segs(df):
 
     return segs
 
-
 def alloc_detailed(segs):
     """
-    Returns a flat table:
+    Flat table:
       Day of week | Date | Start Time | End Time | Client Name | Client Hours
-    - Client Hours rounded UP to nearest 0.25h
-    - NEW: segments marked with force_other=True are always 'Other'
+    - Client Hours rounded to NEAREST 0.25h
+    - Start/End times are the clamped event/gap boundaries
+    - Segments marked force_other=True are always 'Other'
     """
-    cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]
+    cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours", "Work Performed"]
     if not segs:
         return pd.DataFrame(columns=cols)
 
@@ -175,11 +194,10 @@ def alloc_detailed(segs):
 
     rows = []
     for s in segs:
-        # --- NEW: forced Other (e.g., pre-8am gap) ---
+        # forced Other block (e.g., pre-8am)
         if s.get("force_other"):
             owner = "Other"
         else:
-            # existing owner logic
             if any("sittler" in str(n).lower() for n in [s.get("on"), s.get("dn"), s.get("ot"), s.get("dt")]):
                 owner = "Other"
             elif s.get("ot") == "Homeowner":
@@ -194,7 +212,7 @@ def alloc_detailed(segs):
                 owner = h1 or h2 or "Other"
 
         if s["e"] > s["s"]:
-            dur = r_q_h((s["e"] - s["s"]).total_seconds() / 3600.0)
+            dur = r_q_nearest((s["e"] - s["s"]).total_seconds() / 3600.0)
             rows.append(
                 {
                     "Day of week": s["s"].strftime("%A"),
@@ -203,6 +221,7 @@ def alloc_detailed(segs):
                     "End Time": s["e"].time(),
                     "Client Name": owner,
                     "Client Hours": dur,
+                    "Work Performed": ""  # new editable column (default blank)
                 }
             )
 
@@ -211,9 +230,8 @@ def alloc_detailed(segs):
         df = df.sort_values(["Date", "Start Time"]).reset_index(drop=True)
     return df
 
-
 # =========================
-# NEW: Consolidate contiguous same-client rows
+# Consolidate contiguous same-client rows
 # =========================
 def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -221,12 +239,11 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
       - Same Date
       - Same Client Name (case/space-insensitive)
       - Previous End Time == Next Start Time
-    Recompute duration from Start/End for the merged block, then apply quarter-hour ceil once.
+    Recompute duration from Start/End for the merged block, then round to nearest 0.25.
     """
     if df.empty:
         return df
 
-    # Keep only rows with real intervals and client names for consolidation pass
     work = df.dropna(subset=["Start Time", "End Time", "Client Name"]).copy()
     if work.empty:
         return df
@@ -246,29 +263,32 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
         contiguous = row["Start Time"] == prev["End Time"]
 
         if same_day and same_client and contiguous:
-            # extend the previous block's End Time
-            prev["End Time"] = row["End Time"]
-            # duration will be recomputed after scanning
+            prev["End Time"] = row["End Time"]  # extend
         else:
             blocks.append(row.to_dict())
 
-    # Build consolidated DataFrame
     cons = pd.DataFrame(blocks)
-    # Recompute hours exactly from Start/End (no compounding), then ceil to 0.25
+
     def _raw_hours(r):
         start_dt = datetime.datetime.combine(r["Date"], r["Start Time"])
         end_dt = datetime.datetime.combine(r["Date"], r["End Time"])
         return (end_dt - start_dt).total_seconds() / 3600.0
 
-    cons["Client Hours"] = cons.apply(_raw_hours, axis=1).apply(r_q_h)
+    cons["Client Hours"] = cons.apply(_raw_hours, axis=1).apply(r_q_nearest)
     cons["Day of week"] = cons["Date"].apply(lambda d: d.strftime("%A"))
+
+    # Merge back freeform notes ("Work Performed"): keep the first non-empty per block if any
     cons = cons.drop(columns=["_client_norm"], errors="ignore")
     cons = cons[["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]]
 
-    # Now, bring back any original rows that couldn't be consolidated (e.g., placeholders)
+    # Ensure placeholder/non-merge rows remain
     non_merge = df[df["Start Time"].isna() | df["End Time"].isna() | df["Client Name"].isna()]
     out = pd.concat([cons, non_merge], ignore_index=True)
     out = out.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
+
+    # Reattach Work Performed column (blank default)
+    if "Work Performed" not in out.columns:
+        out["Work Performed"] = ""
     return out
 
 # =========================
@@ -316,17 +336,13 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
             Spacer(1, 0.18 * inch),
         ]
 
+        # Copy & format for PDF (friendly times)
         display_df = df_week.copy()
-
-        def fmt_time(t):
-            if pd.isna(t):
-                return ""
-            return f"{int(t.hour):02d}:{int(t.minute):02d}"
 
         if not display_df.empty:
             display_df["Date"] = display_df["Date"].apply(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
-            display_df["Start Time"] = display_df["Start Time"].apply(fmt_time)
-            display_df["End Time"] = display_df["End Time"].apply(fmt_time)
+            display_df["Start Time"] = display_df["Start Time"].apply(fmt_time_friendly)
+            display_df["End Time"] = display_df["End Time"].apply(fmt_time_friendly)
             display_df["Client Hours"] = display_df["Client Hours"].apply(
                 lambda x: (int(x) if (pd.notna(x) and float(x) == int(x)) else ("" if pd.isna(x) else x))
             )
@@ -346,9 +362,9 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
         col_widths = [
             1.1 * inch,  # Day
             1.3 * inch,  # Date
-            1.0 * inch,  # Start
-            1.0 * inch,  # End
-            total_width - (1.1 + 1.3 + 1.0 + 1.0 + 0.9) * inch,  # Client
+            1.2 * inch,  # Start
+            1.2 * inch,  # End
+            total_width - (1.1 + 1.3 + 1.2 + 1.2 + 0.9) * inch,  # Client
             0.9 * inch,  # Hours
         ]
 
@@ -430,7 +446,7 @@ if files:
         st.stop()
 
     enable_edit = st.checkbox(
-        "Enable inline edits (Client / Hours)",
+        "Enable inline edits (Client / Hours / Work Performed)",
         value=False,
         help="Start/End times derive from segments and are not editable here.",
     )
@@ -443,10 +459,10 @@ if files:
         mask = detailed_all["Date"].between(days[0], days[-1])
         df_week = detailed_all.loc[mask].copy()
 
-        # ---- NEW: consolidate contiguous same-client blocks before placeholders ----
+        # Consolidate contiguous same-client blocks
         df_week = consolidate_contiguous(df_week)
 
-        # Ensure at least one placeholder row per weekday (if empty)
+        # Ensure placeholders for empty days
         present = set(df_week["Date"].dropna().unique())
         for d in days:
             if d not in present:
@@ -462,6 +478,7 @@ if files:
                                     "End Time": pd.NaT,
                                     "Client Name": np.nan,
                                     "Client Hours": np.nan,
+                                    "Work Performed": ""
                                 }
                             ]
                         ),
@@ -469,29 +486,36 @@ if files:
                     ignore_index=True,
                 )
 
-        # Order for display
+        # Sort for display
         df_week = df_week.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
+
+        # Friendly time formatting for UI display (we keep raw times in memory)
+        ui_df = df_week.copy()
+        ui_df["Start Time"] = ui_df["Start Time"].apply(fmt_time_friendly)
+        ui_df["End Time"]   = ui_df["End Time"].apply(fmt_time_friendly)
 
         # Editor or read-only
         if enable_edit:
             edited = st.data_editor(
-                df_week,
+                ui_df,
                 key=f"edit_{wk}",
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Client Hours": st.column_config.NumberColumn(label="Client Hours", min_value=0.0, step=0.25),
+                    "Work Performed": st.column_config.TextColumn(width="large"),
                 },
-                disabled=["Day of week", "Date", "Start Time", "End Time"],
+                disabled=["Day of week", "Date", "Start Time", "End Time", "Client Name"],
             )
-            # Normalize hours rounding up to quarter-hour
-            edited["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_h(x) if pd.notna(x) and x != "" else x)
-            render_df = edited
+            # Reflect edits back into df_week
+            df_week["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_nearest(x) if pd.notna(x) and x != "" else x)
+            df_week["Work Performed"] = edited["Work Performed"].fillna("")
+            render_df = edited  # show the friendly-formatted table with notes
         else:
-            render_df = df_week
+            render_df = ui_df
 
         # Totals
-        total_h = float(render_df["Client Hours"].fillna(0).sum())
+        total_h = float(df_week["Client Hours"].fillna(0).sum())
         th_str = int(total_h) if total_h == int(total_h) else round(total_h, 2)
         st.markdown(
             f"**Total Hours:** "
@@ -499,12 +523,36 @@ if files:
             unsafe_allow_html=True,
         )
 
-        # Display
+        # Display detailed rows (with friendly times + editable notes)
         st.dataframe(render_df, use_container_width=True)
 
+        # --- Daily-by-client summary with day totals (unchanged except hours now nearest-0.25) ---
+        tidy = df_week.dropna(subset=["Client Name", "Client Hours"]).copy()
+        pivot = (
+            tidy.pivot_table(
+                index="Date",
+                columns="Client Name",
+                values="Client Hours",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+            .sort_index()
+        )
+        pivot = pivot.reindex(pd.Index(days, name="Date"), fill_value=0.0)
 
-        # Downloads: CSV + PDF + inline preview
-        csv_bytes = render_df.to_csv(index=False).encode("utf-8")
+        cols = list(pivot.columns)
+        if any(c for c in cols if isinstance(c, str) and c.strip().lower() == "other"):
+            other = [c for c in cols if isinstance(c, str) and c.strip().lower() == "other"]
+            non_other = [c for c in cols if c not in other]
+            pivot = pivot[non_other + other]
+
+        pivot["Total"] = pivot.sum(axis=1)
+
+        st.markdown("#### Daily hours by client (with day totals)")
+        st.dataframe(pivot, use_container_width=True)
+
+        # Downloads: CSV (detailed with Work Performed) + PDF + summary CSV
+        csv_bytes = df_week.to_csv(index=False).encode("utf-8")  # raw times here; editable notes included
         st.download_button(
             label=f"Download CSV (Week of {wk:%Y-%m-%d})",
             data=csv_bytes,
@@ -513,7 +561,16 @@ if files:
             key=f"csv_{wk}",
         )
 
-        pdf_bytes = export_pdf_detailed(render_df, wk, employee_name=employee_name)
+        summary_csv = pivot.reset_index().to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"Download Daily Summary CSV (Week of {wk:%Y-%m-%d})",
+            data=summary_csv,
+            file_name=f"Daily_Summary_{wk:%Y-%m-%d}.csv",
+            mime="text/csv",
+            key=f"csv_summary_{wk}",
+        )
+
+        pdf_bytes = export_pdf_detailed(df_week, wk, employee_name=employee_name)
         st.download_button(
             label=f"Download PDF (Week of {wk:%Y-%m-%d})",
             data=pdf_bytes,
