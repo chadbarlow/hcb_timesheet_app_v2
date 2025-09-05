@@ -123,7 +123,7 @@ def build_segs(df):
                 "s": eight, "e": first_cs,
                 "dur": (first_cs - eight).total_seconds()/3600.0,
                 "ot": None, "dt": None, "on": None, "dn": None,
-                "force_other": True  # flag picked up by allocator; means "Not Billable"
+                "force_other": True  # -> "Not Billable"
             })
         for p, c in zip(recs, recs[1:]):
             segs.append({"s": p["cs"], "e": p["ce"], "dur": p["dur_hr"],
@@ -353,6 +353,7 @@ def ingest_file_to_detailed(file_obj) -> pd.DataFrame:
 
 # =========================
 # Styled PDF (merged Day/Date, no zebra, Work Performed 50%, short Mon / MM-DD)
+# + Summary table (Client | Hours) appended after the detailed table
 # =========================
 def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, employee_name: str = "Chad Barlow"):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -371,6 +372,8 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
                                  textColor=colors.HexColor("#31333f"))
         wp_style = ParagraphStyle("WP", fontName=PDF_FONT, fontSize=9, leading=11,
                                   textColor=colors.HexColor("#31333f"))
+        subhead_style = ParagraphStyle("SH", fontName=PDF_FONT_BOLD, fontSize=12,
+                                       spaceBefore=10, spaceAfter=6, textColor=colors.HexColor("#31333f"))
 
         total_hrs = float(df_week["Client Hours"].fillna(0).sum())
         th = int(total_hrs) if total_hrs == int(total_hrs) else round(total_hrs, 2)
@@ -477,6 +480,59 @@ def export_pdf_detailed(df_week: pd.DataFrame, week_monday: datetime.date, emplo
 
         tbl.setStyle(TableStyle(style))
         elems.append(tbl)
+
+        # ===== Summary table: Client | Hours =====
+        # Build from the *numeric* hours before PDF formatting (use df_week directly).
+        sum_work = df_week.copy()
+        sum_work["_hrs"] = pd.to_numeric(sum_work["Client Hours"], errors="coerce").fillna(0.0)
+        sum_work["_client"] = sum_work["Client Name"].fillna("").astype(str)
+        summary = (
+            sum_work.groupby("_client", as_index=False)["_hrs"].sum()
+            .rename(columns={"_client": "Client", "_hrs": "Hours"})
+        )
+        # Drop zero-hour rows (e.g., placeholders)
+        summary = summary[summary["Hours"] > 0].copy()
+        # Sort by hours desc, then client asc
+        summary = summary.sort_values(["Hours", "Client"], ascending=[False, True]).reset_index(drop=True)
+        # Format Hours for display: int if whole else 2 decimals
+        def _fmt_h(v):
+            return int(v) if float(v) == int(v) else round(float(v), 2)
+        summary["Hours"] = summary["Hours"].apply(_fmt_h)
+
+        if not summary.empty:
+            elems.append(Spacer(1, 0.22 * inch))
+            elems.append(Paragraph("Summary by Client", subhead_style))
+
+            sum_headers = ["Client", "Hours"]
+            sum_data = [sum_headers] + summary[sum_headers].values.tolist()
+
+            # Column widths: ~75% / 25% of available width
+            client_w2 = total_width * 0.75
+            hours_w2 = total_width - client_w2
+            tbl_sum = Table(sum_data, colWidths=[client_w2, hours_w2], repeatRows=1)
+
+            sum_style = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f2f6")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#31333f")),
+                ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
+                ("FONTSIZE", (0, 0), (-1, 0), 10),
+                ("ALIGN", (0, 0), (-1, 0), "LEFT"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                ("TOPPADDING", (0, 0), (-1, 0), 6),
+
+                ("FONTNAME", (0, 1), (-1, -1), PDF_FONT),
+                ("FONTSIZE", (0, 1), (-1, -1), 10),
+                ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#31333f")),
+                ("TOPPADDING", (0, 1), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 5),
+
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e4e5e8")),
+                ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ]
+            tbl_sum.setStyle(TableStyle(sum_style))
+            elems.append(tbl_sum)
+
+        # ---- Build the PDF ----
         doc.build(elems)
         with open(tmp.name, "rb") as f:
             pdf_bytes = f.read()
@@ -550,4 +606,89 @@ def _render_pipeline(file_list, section_key_prefix=""):
             df_week["Work Performed"] = ""
 
         present = set(df_week["Date"].dropna().unique())
-        for d in d
+        for d in days:
+            if d not in present:
+                df_week = pd.concat(
+                    [
+                        df_week,
+                        pd.DataFrame([{
+                            "Day of week": d.strftime("%A"), "Date": d,
+                            "Start Time": pd.NaT, "End Time": pd.NaT,
+                            "Client Name": np.nan, "Client Hours": np.nan,
+                            "Work Performed": ""
+                        }])
+                    ],
+                    ignore_index=True,
+                )
+
+        df_week = df_week.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
+
+        if enable_edit:
+            edited = st.data_editor(
+                df_week,
+                key=f"{section_key_prefix}edit_{wk}",
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Client Hours": st.column_config.NumberColumn(label="Client Hours", min_value=0.0, step=0.25),
+                    "Work Performed": st.column_config.TextColumn(width="large"),
+                },
+                disabled=["Day of week", "Date", "Start Time", "End Time", "Client Name"],
+            )
+            edited["Client Hours"] = edited["Client Hours"].apply(lambda x: r_q_h(x) if pd.notna(x) and x != "" else x)
+            render_df = edited
+        else:
+            render_df = df_week
+
+        total_h = float(render_df["Client Hours"].fillna(0).sum())
+        th_str = int(total_h) if total_h == int(total_h) else round(total_h, 2)
+        st.markdown(
+            f"**Total Hours:** "
+            f"<span style='background:#fffac1;color:#373737;padding:2px 6px;border-radius:4px;'>{th_str}</span>",
+            unsafe_allow_html=True,
+        )
+
+        st.dataframe(render_df, use_container_width=True)
+
+        csv_bytes = render_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"Download CSV (Week of {wk:%Y-%m-%d})",
+            data=csv_bytes,
+            file_name=f"Detailed_Segments_{wk:%Y-%m-%d}.csv",
+            mime="text/csv",
+            key=f"{section_key_prefix}csv_{wk}",
+        )
+
+        pdf_bytes = export_pdf_detailed(render_df, wk, employee_name=employee_name)
+        st.download_button(
+            label=f"Download PDF (Week of {wk:%Y-%m-%d})",
+            data=pdf_bytes,
+            file_name=f"HCB_Timesheet_Detailed_{wk:%Y-%m-%d}.pdf",
+            mime="application/pdf",
+            key=f"{section_key_prefix}pdf_{wk}",
+        )
+
+        b64 = base64.b64encode(pdf_bytes).decode()
+        st.markdown(
+            f"""
+            <object data="data:application/pdf;base64,{b64}" type="application/pdf" width="100%" height="800px">
+                <embed src="data:application/pdf;base64,{b64}" type="application/pdf"/>
+            </object>
+            """,
+            unsafe_allow_html=True,
+        )
+
+# =========================
+# UI sections
+# =========================
+st.set_page_config(layout="wide")
+st.subheader("Upload MileIQ CSVs (or detailed CSVs); duplicates ignored")
+files = st.file_uploader("Upload CSVs", type=["csv"], accept_multiple_files=True, key="main_files")
+if files:
+    _render_pipeline(files, section_key_prefix="main_")
+
+st.markdown("---")
+st.header("Revised CSV — Process & Format (same as usual)")
+revised_files = st.file_uploader("Upload revised CSVs", type=["csv"], accept_multiple_files=True, key="revised_files")
+if revised_files:
+    _render_pipeline(revised_files, section_key_prefix="rev_")
