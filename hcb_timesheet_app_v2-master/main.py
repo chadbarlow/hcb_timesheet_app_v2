@@ -52,6 +52,19 @@ find_weeks = lambda dates: sorted(list(set(get_mon(d) for d in dates)))
 def _norm_client(x: str) -> str:
     return (x or "").strip().casefold()
 
+def round_to_quarter(dt: datetime.datetime) -> datetime.datetime:
+    """
+    Round a datetime to the nearest 15 minutes.
+    Half-quarters (7.5 min) round up.
+    """
+    if pd.isna(dt):
+        return dt
+    base = dt.replace(second=0, microsecond=0, minute=0)
+    mins = dt.minute + dt.second / 60.0
+    q = int(round(mins / 15.0))  # 0..4
+    return base + datetime.timedelta(minutes=15 * q)
+
+
 # =========================
 # Data processing
 # =========================
@@ -161,8 +174,9 @@ def alloc_detailed(segs):
     """
     Returns a flat table:
       Day of week | Date | Start Time | End Time | Client Name | Client Hours
-    - Client Hours rounded UP to nearest 0.25h
-    - NEW: segments marked with force_other=True are always 'Other'
+    - Start/End are rounded to the nearest 0.25h.
+    - Client Hours = exact (End - Start) in hours (no rounding).
+    - Segments marked with force_other=True are always 'Other'.
     """
     cols = ["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]
     if not segs:
@@ -175,11 +189,10 @@ def alloc_detailed(segs):
 
     rows = []
     for s in segs:
-        # --- NEW: forced Other (e.g., pre-8am gap) ---
+        # owner inference (unchanged, except forced 'Other' honored)
         if s.get("force_other"):
             owner = "Other"
         else:
-            # existing owner logic
             if any("sittler" in str(n).lower() for n in [s.get("on"), s.get("dn"), s.get("ot"), s.get("dt")]):
                 owner = "Other"
             elif s.get("ot") == "Homeowner":
@@ -193,23 +206,30 @@ def alloc_detailed(segs):
                 h2 = dep[j]["on"] if j < len(s_ts) else None
                 owner = h1 or h2 or "Other"
 
-        if s["e"] > s["s"]:
-            dur = r_q_h((s["e"] - s["s"]).total_seconds() / 3600.0)
-            rows.append(
-                {
-                    "Day of week": s["s"].strftime("%A"),
-                    "Date": s["s"].date(),
-                    "Start Time": s["s"].time(),
-                    "End Time": s["e"].time(),
-                    "Client Name": owner,
-                    "Client Hours": dur,
-                }
-            )
+        # round start/end to nearest quarter-hour
+        rs = round_to_quarter(s["s"])
+        re = round_to_quarter(s["e"])
+        if re <= rs:
+            continue  # very short segment collapsed by rounding
+
+        hours = (re - rs).total_seconds() / 3600.0  # exact (no rounding)
+
+        rows.append(
+            {
+                "Day of week": rs.strftime("%A"),
+                "Date": rs.date(),
+                "Start Time": rs.time(),
+                "End Time": re.time(),
+                "Client Name": owner,
+                "Client Hours": hours,
+            }
+        )
 
     df = pd.DataFrame(rows, columns=cols)
     if not df.empty:
         df = df.sort_values(["Date", "Start Time"]).reset_index(drop=True)
     return df
+
 
 
 # =========================
@@ -221,12 +241,11 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
       - Same Date
       - Same Client Name (case/space-insensitive)
       - Previous End Time == Next Start Time
-    Recompute duration from Start/End for the merged block, then apply quarter-hour ceil once.
+    After merging, recompute Client Hours as exact difference (no rounding).
     """
     if df.empty:
         return df
 
-    # Keep only rows with real intervals and client names for consolidation pass
     work = df.dropna(subset=["Start Time", "End Time", "Client Name"]).copy()
     if work.empty:
         return df
@@ -237,8 +256,7 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
     blocks = []
     for _, row in work.iterrows():
         if not blocks:
-            blocks.append(row.to_dict())
-            continue
+            blocks.append(row.to_dict()); continue
 
         prev = blocks[-1]
         same_day = row["Date"] == prev["Date"]
@@ -246,30 +264,28 @@ def consolidate_contiguous(df: pd.DataFrame) -> pd.DataFrame:
         contiguous = row["Start Time"] == prev["End Time"]
 
         if same_day and same_client and contiguous:
-            # extend the previous block's End Time
-            prev["End Time"] = row["End Time"]
-            # duration will be recomputed after scanning
+            prev["End Time"] = row["End Time"]  # extend block
         else:
             blocks.append(row.to_dict())
 
-    # Build consolidated DataFrame
     cons = pd.DataFrame(blocks)
-    # Recompute hours exactly from Start/End (no compounding), then ceil to 0.25
-    def _raw_hours(r):
+
+    def _hours(r):
         start_dt = datetime.datetime.combine(r["Date"], r["Start Time"])
-        end_dt = datetime.datetime.combine(r["Date"], r["End Time"])
+        end_dt   = datetime.datetime.combine(r["Date"], r["End Time"])
         return (end_dt - start_dt).total_seconds() / 3600.0
 
-    cons["Client Hours"] = cons.apply(_raw_hours, axis=1).apply(r_q_h)
+    cons["Client Hours"] = cons.apply(_hours, axis=1)
     cons["Day of week"] = cons["Date"].apply(lambda d: d.strftime("%A"))
     cons = cons.drop(columns=["_client_norm"], errors="ignore")
     cons = cons[["Day of week", "Date", "Start Time", "End Time", "Client Name", "Client Hours"]]
 
-    # Now, bring back any original rows that couldn't be consolidated (e.g., placeholders)
+    # bring back placeholder rows (if any)
     non_merge = df[df["Start Time"].isna() | df["End Time"].isna() | df["Client Name"].isna()]
     out = pd.concat([cons, non_merge], ignore_index=True)
     out = out.sort_values(["Date", "Start Time"], na_position="last").reset_index(drop=True)
     return out
+
 
 # =========================
 # Styled PDF (Detailed Rows)
